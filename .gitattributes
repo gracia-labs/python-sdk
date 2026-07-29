@@ -1,0 +1,6 @@
+# Force LF for all text files
+* text=auto eol=lf
+
+# Prebuilt wheels are the product of this repo — plain binaries, not LFS, so
+# `pip install` straight from a raw GitHub URL keeps working.
+*.whl binary

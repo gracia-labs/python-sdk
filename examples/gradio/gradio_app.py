@@ -15,7 +15,7 @@ from PIL import Image
 
 _TMP_DIR = Path(tempfile.mkdtemp(prefix="gragrade_"))
 
-from graciasdk import GraciaSDK, camera_from_bbox, camera_from_colmap
+from graciasdk import DEFAULT_FPS, GraciaSDK, camera_from_bbox, camera_from_colmap
 
 # ── COLMAP binary loader ──────────────────────────────────────────────────────
 
@@ -76,6 +76,8 @@ _FOV = math.radians(60)
 _sdk: GraciaSDK | None = None
 _scene = None
 _colmap_cameras: list[_ColmapCam] = []
+_instances: list[tuple[int, str]] = []
+_scene_cameras: tuple = ()
 
 
 def _init():
@@ -93,22 +95,43 @@ def _to_pil(rgba: np.ndarray) -> Image.Image:
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
+def _instance_update():
+    choices = [("All classes", 0)] + [(name, iid) for iid, name in _instances]
+    return gr.update(choices=choices, value=0, visible=bool(_instances))
+
+
+def _camera_update():
+    choices = [("Off", -1)] + [
+        (f"{c.name} ({c.kind})", i) for i, c in enumerate(_scene_cameras)
+    ]
+    return (gr.update(choices=choices, value=-1, visible=bool(_scene_cameras)),
+            gr.update(visible=any(c.is_dynamic for c in _scene_cameras)))
+
+
 def load_scene(file_path: str | None):
-    global _scene
+    global _scene, _instances, _scene_cameras
     _invalidate_render_cache()
+    _instances = []
+    _scene_cameras = ()
     if not file_path or not Path(file_path).is_file():
         _scene = None
-        return gr.update(visible=False)
+        return (gr.update(visible=False), _instance_update(), *_camera_update())
 
     try:
         _scene = _init().load(file_path)
     except Exception:
         _scene = None
-        return gr.update(visible=False)
+        return (gr.update(visible=False), _instance_update(), *_camera_update())
 
     if _scene.is_video:
-        _scene.wait_ready()
-    return gr.update(visible=_scene.is_video)
+        try:
+            _scene.wait_ready()
+        except RuntimeError:
+            _scene = None
+            return (gr.update(visible=False), _instance_update(), *_camera_update())
+        _instances = sorted(_scene.instance_names().items())
+        _scene_cameras = _scene.cameras
+    return (gr.update(visible=_scene.is_video), _instance_update(), *_camera_update())
 
 
 def load_colmap(files: list[str] | None):
@@ -138,7 +161,29 @@ def load_colmap(files: list[str] | None):
     )
 
 
-def _cam_info(colmap_name: str | None) -> str:
+def _camera_at(index: int | None):
+    if index is None or not (0 <= index < len(_scene_cameras)):
+        return None
+    return _scene_cameras[index]
+
+
+def _clip_seconds(video_time: float) -> float:
+    """The end of the clip is exclusive: a seek to the duration shows nothing."""
+    if not (_scene and _scene.is_video):
+        return 0.0
+    duration = _scene.duration()
+    return min(float(video_time) * duration, max(0.0, duration - 1e-6))
+
+
+def _cam_info(colmap_name: str | None, camera_index: int | None,
+              video_time: float, fps: float) -> str:
+    sc = _camera_at(camera_index)
+    if sc is not None:
+        fx, fy, cx, cy = sc.pinhole
+        pose = min(max(_clip_seconds(video_time) * float(fps), 0.0), sc.poses_count - 1)
+        return (f"scene camera {sc.name} ({sc.kind})  {sc.width}×{sc.height}\n"
+                f"fx={fx:.1f}  fy={fy:.1f}  cx={cx:.1f}  cy={cy:.1f}\n"
+                f"pose {pose:.2f} of {sc.poses_count - 1}  at {fps:g} fps")
     if not colmap_name or not _colmap_cameras:
         return f"bbox camera  {_W}×{_H}  fov={math.degrees(_FOV):.0f}°"
     cc = next((c for c in _colmap_cameras if c.name == colmap_name), None)
@@ -160,16 +205,26 @@ def _invalidate_render_cache() -> None:
     _cached_paths = {}
 
 
-def _save(img: Image.Image, name: str) -> str:
+def _save(img: Image.Image, name: str, size: tuple[int, int] | None = None) -> str:
     p = _TMP_DIR / f"{name}.png"
+    if size and size != img.size:
+        img = img.resize(size, Image.LANCZOS)
     img.save(p, "PNG", compress_level=1)
     return str(p)
 
 
-def _do_render(video_time: float, colmap_name: str | None):
-    """Re-render only if camera/time changed. Saves images to disk."""
+def _display_size(width: int, height: int) -> tuple[int, int]:
+    """The square render holds the full camera frame, thus the preview needs the
+    aspect ratio of the source image to show it without distortion."""
+    scale = min(_W / width, _H / height)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _do_render(video_time: float, colmap_name: str | None, instance_id: int | None,
+               camera_index: int | None, fps: float):
+    """Re-render only if camera/time/class changed. Saves images to disk."""
     global _cached_key, _cached_paths
-    key = (video_time, colmap_name)
+    key = (video_time, colmap_name, instance_id, camera_index, fps)
     if key == _cached_key and _cached_paths:
         return
 
@@ -178,10 +233,18 @@ def _do_render(video_time: float, colmap_name: str | None):
 
     _init()
     if _scene.is_video:
-        _scene.set_time(float(video_time) * _scene.duration())
+        _scene.set_time(_clip_seconds(video_time))
+        if not _scene.wait_buffered():
+            _invalidate_render_cache()   # nothing to draw yet: keep the last frame
+            raise RuntimeError("buffering")
+    _scene.set_uint("instance_filter", int(instance_id or 0))
 
-    cam = None
-    if colmap_name and _colmap_cameras:
+    cam, size = None, None
+    sc = _camera_at(camera_index)
+    if sc is not None:
+        cam = sc.at(_clip_seconds(video_time), float(fps))
+        size = _display_size(sc.width, sc.height)
+    elif colmap_name and _colmap_cameras:
         cc = next((c for c in _colmap_cameras if c.name == colmap_name), None)
         if cc:
             cam = camera_from_colmap(
@@ -189,38 +252,44 @@ def _do_render(video_time: float, colmap_name: str | None):
                 fx=cc.fx, fy=cc.fy, cx=cc.cx, cy=cc.cy,
                 width=cc.width, height=cc.height,
             )
+            size = _display_size(cc.width, cc.height)
     if cam is None:
         cam = camera_from_bbox(_scene.bbox(), _W, _H, fov_y=_FOV)
 
     out = _sdk.render(_scene, cam)
-    _cached_paths["RGB"] = _save(_to_pil(out.color), "rgb")
-    _cached_paths["Depth"] = _save(_depth_pil(out.depth), "depth")
+    _cached_paths["RGB"] = _save(_to_pil(out.color), "rgb", size)
+    _cached_paths["Depth"] = _save(_depth_pil(out.depth, out.coverage), "depth", size)
     if out.mesh_color is not None:
-        _cached_paths["Mesh"] = _save(_to_pil(out.mesh_color), "mesh")
+        _cached_paths["Mesh"] = _save(_to_pil(out.mesh_color), "mesh", size)
 
 
-def render(video_time: float, mode: str, colmap_name: str | None):
+def render(video_time: float, mode: str, colmap_name: str | None,
+           instance_id: int | None, camera_index: int | None, fps: float):
+    fps = float(fps) if fps else DEFAULT_FPS
+    info = _cam_info(colmap_name, camera_index, video_time, fps)
     if _scene is None:
-        return None, _cam_info(colmap_name)
+        return None, info
     try:
-        _do_render(video_time, colmap_name)
-        path = _cached_paths.get(mode)
-        if path is None:
-            return None, _cam_info(colmap_name)
-        return path, _cam_info(colmap_name)
+        _do_render(video_time, colmap_name, instance_id, camera_index, fps)
+        return _cached_paths.get(mode), info
+    except RuntimeError as e:
+        return None, f"{info}\n{e}" if str(e) == "buffering" else info
     except Exception:
-        return None, _cam_info(colmap_name)
+        return None, info
 
 
-def _depth_pil(d: np.ndarray) -> Image.Image:
+def _depth_pil(d: np.ndarray, coverage: np.ndarray) -> Image.Image:
+    """Depth is a ratio, thus a barely covered pixel gets a full-strength value
+    and the edges get a hard fringe. Multiply by the coverage to give the edges
+    the same falloff that the colour has."""
     mask = d != 0
-    g = np.zeros(d.shape, dtype=np.uint8)
+    g = np.zeros(d.shape, dtype=np.float32)
     if mask.any():
         v = d[mask]
         lo, hi = float(v.min()), float(v.max())
-        norm = (d - lo) / (hi - lo) if hi > lo else np.where(mask, 1.0, 0.0)
-        g = np.clip(np.where(mask, norm, 0.0) * 255.0, 0, 255).astype(np.uint8)
-    return Image.fromarray(g, "L")
+        g[mask] = (v - lo) / (hi - lo) if hi > lo else 1.0
+    g *= np.clip(coverage, 0.0, 1.0)
+    return Image.fromarray(np.clip(g * 255.0, 0, 255).astype(np.uint8), "L")
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -234,6 +303,12 @@ def main() -> None:
                                      file_count="single", type="filepath")
                 mode = gr.Radio(["RGB", "Depth", "Mesh"], value="RGB", label="Mode")
                 video_time = gr.Slider(0, 1, value=0, step=0.01, label="T", visible=False)
+                instance_select = gr.Dropdown(label="Class", choices=[("All classes", 0)],
+                                              value=0, visible=False, interactive=True)
+                camera_select = gr.Dropdown(label="Scene camera", choices=[("Off", -1)],
+                                             value=-1, visible=False, interactive=True)
+                camera_fps = gr.Number(label="Camera fps", value=DEFAULT_FPS, minimum=1,
+                                        step=1, visible=False, interactive=True)
                 gr.Markdown("---")
                 colmap_file = gr.File(label="COLMAP (images.bin + cameras.bin)",
                                       file_types=[".bin"], file_count="multiple", type="filepath")
@@ -243,11 +318,12 @@ def main() -> None:
             with gr.Column(scale=1):
                 preview = gr.Image(label="Preview", type="filepath", elem_id="preview")
 
-        inputs = [video_time, mode, colmap_select]
+        inputs = [video_time, mode, colmap_select, instance_select, camera_select, camera_fps]
         outputs = [preview, cam_info]
-        scene_file.change(load_scene, scene_file, [video_time]).then(render, inputs, outputs)
+        scene_outputs = [video_time, instance_select, camera_select, camera_fps]
+        scene_file.change(load_scene, scene_file, scene_outputs).then(render, inputs, outputs)
         colmap_file.change(load_colmap, colmap_file, [colmap_select, colmap_status]).then(render, inputs, outputs)
-        for inp in (video_time, mode, colmap_select):
+        for inp in (video_time, mode, colmap_select, instance_select, camera_select, camera_fps):
             inp.change(render, inputs, outputs)
 
     demo.queue(default_concurrency_limit=1)

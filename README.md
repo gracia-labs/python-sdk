@@ -96,16 +96,29 @@ They are demo content: for demonstration and evaluation, not for redistribution 
 
 ## Video (4DGS)
 
-Video scenes decode in the background. Wait for the first frames before you render:
+Video scenes decode in the background. A seek is not instant: the decoder fetches and uploads a chunk over several turns, so the data for the time you asked for is usually not on the GPU when `set_time()` returns. `render()` waits for it, thus the simple thing works:
 
 ```python
 scene = sdk.load("clip.mint")
-scene.wait_ready()                        # blocks, 30s timeout by default
 scene.set_time(0.5 * scene.duration())    # seek, in seconds
-frame = sdk.render(scene, cam)
+frame = sdk.render(scene, cam)            # waits for the data for that time
 ```
 
-`scene.ready()` is the non-blocking poll. Only video scenes can return `out.mesh_color`. For static scenes it is always `None`.
+The wait is 5 seconds per scene by default; `render(..., wait=10.0)` sets it, and `render(..., wait=False)` skips it. A timeout never raises — the frame comes back with `frame.buffering == True`, which means it is *not* the time you asked for: the frame of an earlier time, or an empty frame if nothing had decoded yet. A static scene is never buffering.
+
+```python
+frame = sdk.render(scene, cam, wait=False)   # draw whatever has decoded
+if frame.buffering:
+    ...                                      # not the time you asked for
+```
+
+Drive it yourself with `scene.wait_buffered(timeout=5.0)` when you want the outcome *before* you commit to a render — it returns `True` when the data is ready and `False` on timeout, and never raises, thus a render loop can skip a frame and continue. `scene.is_buffering()` is the same signal without the wait.
+
+Each `render()` also steps the decoder once, exactly as the native players pump it every frame, so a loop that only calls `render()` keeps making progress.
+
+`scene.wait_ready()` blocks for the **first** frame (30s timeout); `render()` does it for you. `scene.ready()` is the non-blocking poll for it — note it stays `True` afterwards, thus it does not tell you that a later seek has data. `scene.bbox()` and `scene.adaptive_bbox()` wait for ready themselves, thus they can block too.
+
+Only video scenes can return `out.mesh_color`. For static scenes it is always `None`.
 
 ## Cameras
 
@@ -128,23 +141,78 @@ cam = make_camera(perspective(math.radians(60), 1.0, 0.1, 100.0),
                   np.ascontiguousarray(np.linalg.inv(view.T).T))
 ```
 
+## Cameras in the scene
+
+A `.mint` file can carry the COLMAP cameras that recorded it. `sdk.load()` reads and transforms them one time, thus a camera at a given time costs almost nothing to get.
+
+```python
+scene = sdk.load("clip.mint")
+
+len(scene.cameras)                  # how many cameras the file carries
+scene.camera_kinds                  # ("static", "static", …, "dynamic") — one for each camera
+[c.name for c in scene.cameras]     # ("001", "002", …)
+
+cam = scene.camera("014")           # by name, or scene.camera(13) by index
+out = sdk.render(scene, cam.at(time=1.5, fps=30))
+```
+
+`cam.at(time, fps)` gives a `CameraSetup` for that time in seconds:
+
+- A **static** camera holds one pose. It ignores the time.
+- A **dynamic** camera holds one pose for each frame. `time * fps` gives the pose index: a whole index gives that pose, and an index between two poses interpolates them — the rotation along the shortest arc, and the position along a straight line. A time before the first pose or after the last pose clamps to it.
+
+Give `set_time()` and `at()` the same time to keep the camera and the frame together. Use the frame rate that the capture ran at as `fps` — the default is 30.
+
+The projection comes from the COLMAP intrinsics of the source image. Thus render at the aspect ratio of `cam.width / cam.height`, or resize the result to it, for an image with no distortion. The example does the second.
+
+A static scene, and a video with no camera data, report `scene.cameras` as empty.
+
 ## API
 
 **`GraciaSDK(width=4096, height=4096, max_splats_count=16_000_000)`**
 - `.load(path) -> Scene`
-- `.render(scene | [scenes], camera, model_transform=None) -> RenderResult`
+- `.render(scene | [scenes], camera, model_transform=None, wait=True) -> RenderResult` — `wait` is the seconds to wait for a video scene's current time (`True` = 5s, `False` = no wait); a timeout is reported as `RenderResult.buffering`, never raised
 
 **`Scene`**
-- `.bbox() -> (min_x, min_y, min_z, max_x, max_y, max_z)`
-- `.count() -> int` — splat count
+- `.bbox() -> (min_x, min_y, min_z, max_x, max_y, max_z)` — for a video it waits for the stream to be ready, thus it can block
+- `.adaptive_bbox()` — the same, with the outliers discounted
+- `.count() -> int` — splat count. For a video it is the frame drawn last: `0` before the first render
 - `.set_transform(m)` — 4×4 model matrix
 - `.set_flag(key, value)`
 - `.is_video`, `.duration()`, `.set_time(t)`, `.wait_ready(timeout=30.0)`, `.ready()`
+- `.is_buffering() -> bool` — the current time has no data yet (video only)
+- `.wait_buffered(timeout=5.0) -> bool` — block while it buffers; `False` on timeout, never raises
+- `.cameras -> (SceneCamera, …)` — the cameras that the file carries, sorted by name
+- `.camera_kinds -> ("static" | "dynamic", …)` — one for each camera, in the same order
+- `.camera(name | index) -> SceneCamera`
+
+**`SceneCamera`**
+- `.at(time=0.0, fps=30.0) -> CameraSetup` — the camera to render with at that time
+- `.name`, `.kind`, `.is_dynamic`, `.poses_count`
+- `.width`, `.height`, `.model`, `.pinhole` — source image size and intrinsics `(fx, fy, cx, cy)`
+- `.qvecs`, `.tvecs` — the COLMAP world-to-camera poses, `(N, 4)` and `(N, 3)` `float32`
 
 **`RenderResult`**
 - `.color` — RGBA `float16` `(H, W, 4)`, values in `[0, 1]`
 - `.depth` — `float32` `(H, W)`, raw view-space Z (unnormalized, negative in front of the camera); `0` where nothing was hit. Normalize it yourself for display.
+- `.coverage` — `float32` `(H, W)` in `[0, 1]`, the accumulated opacity of the splats
 - `.mesh_color` — RGBA `uint8` `(H, W, 4)`, or `None` (video scenes only)
+- `.buffering` — the frame is not the time that was asked for (video only; see [Video](#video-4dgs))
+
+The depth of a pixel is the mean view-space Z of the splats on it, weighted by what each splat adds to the color. A pixel with coverage below `1/255` gets depth `0`, the same threshold the renderer applies.
+
+**Multiply by `.coverage` when you show the depth.** The depth is a ratio, thus the division gives a pixel with 2 percent coverage the same full-strength Z as an opaque pixel, and every object gets a hard fringe of stray splats along its edges. The color pass has no such fringe, because a 2 percent pixel stays 2 percent bright. The multiplication puts that falloff back, and it is what the renderer does internally:
+
+```python
+out = sdk.render(scene, cam)
+mask = out.coverage > 0                                    # where splats were drawn
+near, far = out.depth[mask].max(), out.depth[mask].min()   # Z is negative in front
+
+grey = (out.depth - far) / (near - far)                    # normalize, then
+grey *= out.coverage                                       # keep partly covered edges faint
+```
+
+Keep `.depth` itself as it is for measurement — the multiplication is for display only. Use `.coverage` as the mask of the splats too, **not** the alpha of `.color`: the color target clears to opaque black, thus its alpha is `1` everywhere.
 
 ## Example
 
@@ -155,6 +223,21 @@ cd examples/gradio
 uv run --find-links ../../wheels --with graciasdk --with gradio gradio_app.py
 ```
 
+### RGB, depth, and instance notebook
+
+[`examples/notebooks/mint_rgb_depth_instances.ipynb`](examples/notebooks/mint_rgb_depth_instances.ipynb) is a complete MINT rendering tutorial. It selects an embedded dynamic camera with a reproducible random seed. It renders the first 30 RGB and depth frames, writes H.264 videos, and displays both videos in the notebook. It then renders every embedded instance ID at frame 0 and draws the visible masks over RGB. It does not read an external `cameras.json` file.
+
+The companion [`requirements.txt`](examples/notebooks/requirements.txt) lists every direct dependency. Run the notebook from the repository root:
+
+```sh
+uv run --isolated --no-project --python 3.12 \
+  --find-links wheels \
+  --with-requirements examples/notebooks/requirements.txt \
+  jupyter lab examples/notebooks/mint_rgb_depth_instances.ipynb
+```
+
+Set `MINT_PATH` in the **Settings** cell before the first run. The MINT must contain a `CAMERAS` chunk and at least one dynamic camera track.
+
 ## Troubleshooting
 
 **`... is not a supported wheel on this platform`** — your Python is older than 3.12, or the platform or architecture of the wheel does not match your host. Check with `python -c "import sys; print(sys.version_info[:2])"`.
@@ -163,7 +246,17 @@ uv run --find-links ../../wheels --with graciasdk --with gradio gradio_app.py
 
 **Import fails on a missing shared library** — install the wheel with `pip` or `uv`. Do not copy files out of `site-packages` by hand. The package works only when it is complete.
 
-**Blank or black renders** — for video scenes, call `wait_ready()` before the first `render()`. For static scenes, check that the camera frames the geometry. `camera_from_bbox(scene.bbox(), ...)` is the safe default.
+**A new wheel installs, but the old one runs** — every wheel keeps the version `0.1.0`, thus the tools match it in their cache and install the old file again. An attribute that the new wheel adds then raises `AttributeError`. Clear the cache for the package and install it again:
+
+```sh
+uv cache clean graciasdk && uv run --refresh ...
+# or
+pip install --no-cache-dir --force-reinstall --find-links wheels graciasdk
+```
+
+**Blank or black renders** — for a video scene, check `RenderResult.buffering`: `True` means the data for that time never arrived within the wait, and an all-black frame means nothing had decoded at all. Raise the wait (`render(..., wait=30.0)`) for a slow disk or a stream. For a static scene, check that the camera frames the geometry — `camera_from_bbox(scene.bbox(), ...)` is the safe default.
+
+**A frame that ignores `set_time()`** — you are rendering with `wait=False` and the decoder had not caught up; the loader keeps showing the last good frame while it buffers. `RenderResult.buffering` flags exactly that.
 
 **GPU initialization fails** — confirm a Vulkan-capable driver (Windows/Linux) or macOS 11 or later for Metal. Headless Linux still needs a real GPU device and driver.
 

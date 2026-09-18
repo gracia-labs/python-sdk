@@ -1,0 +1,7 @@
+av==17.0.0
+graciasdk==0.1.0
+ipykernel>=6.29,<8
+ipython>=8,<10
+jupyterlab>=4.3,<5
+matplotlib>=3.8,<4
+numpy>=1.26,<3

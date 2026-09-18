@@ -7,9 +7,10 @@
 This is a **distribution repository**: the prebuilt `graciasdk` wheels, the documentation to use them, and an example that runs. There is no source code here, and nothing in this repository compiles.
 
 ```
-wheels/            prebuilt .whl artifacts, one per (python tag, platform tag)
-examples/gradio/   gradio UI exercising the public API
-README.md          install + API reference — the only docs users get
+wheels/              prebuilt .whl artifacts, one per (python tag, platform tag)
+examples/gradio/     gradio UI exercising the public API
+examples/notebooks/  a video tutorial notebook and its requirements
+README.md            install + API reference — the only docs users get
 ```
 
 The wheels are published artifacts. Each wheel carries the compiled extension module with `graciasdk/__init__.py`, the Python wrapper. Treat them as opaque and immutable.
@@ -38,7 +39,23 @@ uv run --find-links ../../wheels --with graciasdk --with gradio gradio_app.py
 uv run --find-links ../../wheels --with graciasdk python -c "import graciasdk; print(graciasdk.__all__)"
 ```
 
-A real render needs a GPU (Vulkan on Windows/Linux, Metal on macOS) and a scene file. `.ply` / `.sog` are static. `.mint` is 4DGS video, and it needs `wait_ready()` before the first frame.
+A real render needs a GPU (Vulkan on Windows/Linux, Metal on macOS) and a scene file. `.ply` / `.sog` are static. Every other file is 4DGS video, and a view waits for its data. Only a video of the capture pipeline carries cameras, instance labels and point clouds.
+
+### A new wheel does not appear
+
+Every wheel keeps the version `0.1.0`. Thus `uv` matches `graciasdk==0.1.0` in its cache and installs the **old** file again, and the new one is ignored. The symptom is code that fails on an attribute that the new wheel adds, for example `AttributeError: 'GraciaSDK' object has no attribute 'view'`.
+
+Clear the cache for the package, and run with `--refresh`:
+
+```sh
+uv cache clean graciasdk
+find "$(uv cache dir)/archive-v0" -maxdepth 6 -name graciasdk -type d |
+  sed -E 's#(.*/archive-v0/[^/]+).*#\1#' | sort -u | xargs rm -rf
+
+uv run --refresh --find-links ../../wheels --with graciasdk --with gradio gradio_app.py
+```
+
+`uv cache clean graciasdk` alone is **not** enough. It removes the cached wheel, but it leaves the unpacked trees under `archive-v0/`, which an environment hard-links from. The `find` above deletes those too. For pip, use `pip install --no-cache-dir --force-reinstall`.
 
 ## Conventions
 

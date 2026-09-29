@@ -117,7 +117,7 @@ view = sdk.view(scene, cam, 1024, 1024, time=0.5 * scene.duration())
 view.color8                               # waits for the data for that time
 ```
 
-The wait is 5 seconds for each scene by default. `sdk.view(..., wait=10.0)` sets it, and `wait=False` skips it. A timeout never raises: `view.buffering` becomes `True`, which means that an output is *not* the time that you asked for. It shows an earlier time, or nothing if nothing had decoded yet. A static scene is never buffering.
+The wait is 5 seconds for each scene by default. `sdk.view(..., wait=10.0)` sets it, and `wait=False` skips it. A read never raises when the data is not there after the wait, also with `wait=False`: `view.buffering` becomes `True`, which means that an output is *not* the time that you asked for. It shows an earlier time, or nothing if nothing had decoded yet. A static scene is never buffering.
 
 A view first waits for the **first** frame of a video (30 s timeout), and it raises `RuntimeError` when that times out. `scene.wait_ready()`, `scene.ready()`, `scene.wait_buffered(timeout=5.0)` and `scene.is_buffering()` give the same signals without a view. `scene.bbox()` and `scene.adaptive_bbox()` wait for ready themselves, thus they can block too.
 

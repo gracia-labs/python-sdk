@@ -201,6 +201,18 @@ for cloud, points in view.points:         # each point cloud at view.time
 
 A static scene and a video with no point clouds report `scene.point_clouds` as empty.
 
+## Custom data in the scene
+
+A video's track can carry custom data: entries of any bytes, each with a key and a description. Several entries can have the same key. `scene.custom_data_keys()` lists the key and the description of each entry, and `scene.custom_data(key)` gives the description and the bytes of each entry with that key. Both keep the order of the file:
+
+```python
+scene.custom_data_keys()                  # (("rig", "the capture rig as JSON"), ("note", "…"), …)
+for description, data in scene.custom_data("rig"):
+    rig = json.loads(data)
+```
+
+The scene reads the file at each call: `custom_data_keys` reads its head alone, and `custom_data` also the bytes of the entries with the key. A video with no custom data, a key that no entry has, and a static scene give an empty tuple.
+
 ## API
 
 **`GraciaSDK(max_splats_count=16_000_000)`**
@@ -235,6 +247,8 @@ The arrays of a view belong to the view: copy an array before you draw into it.
 - `.camera_kinds -> ("static" | "dynamic", …)` — one for each camera, in the same order
 - `.camera(name | index) -> SceneCamera`
 - `.point_clouds -> (PointCloud, …)` — the point clouds that the file carries, in the order of the file
+- `.custom_data_keys() -> ((key, description), …)` — the key and the description of each entry of custom data, in the order of the file
+- `.custom_data(key) -> ((description, bytes), …)` — the entries of custom data with that key, in the order of the file
 
 **`SceneCamera`**
 - `.at(time=0.0) -> CameraSetup` — the camera to render with at that time

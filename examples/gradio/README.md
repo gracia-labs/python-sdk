@@ -1,6 +1,6 @@
 # Gradio example
 
-Local UI for `graciasdk`: load a scene, frame it from its bounding box or step through the cameras of the capture, switch between RGB, depth, and flow, scrub the timeline for 4DGS video, isolate one segmentation class, and draw the point clouds of the file.
+Local UI for `graciasdk`: load a scene, frame it from its bounding box or step through the cameras of the capture, switch between RGB, depth, and flow, scrub the timeline for 4DGS video, isolate one segmentation class, draw the point clouds of the file, and read its custom data.
 
 ## Run
 
@@ -29,6 +29,7 @@ The app opens a browser on `127.0.0.1`. Set `GRADIO_SERVER_NAME=0.0.0.0` to serv
 - **Flow to T** — a video scene shows this slider. It sets the second time of the flow, on the same scale as `T`. When it is equal to `T`, nothing moves.
 - **Flow colors** — the move of the 95th percentile of the moves in the image shows full color, and the camera box states that scale. `Flow` shows the direction of the move as the hue on the Middlebury color wheel: a pixel with no move is white, and a pixel with no splat in both frames is black. `Flow arrows` draws an arrow every 28 pixels of the preview over the RGB image, in the color that `Flow` gives its pixel. The camera box shows the scale and the percentage of the image that has flow.
 - **Class** — a video with segmentation lists its classes here. Select one to render that instance in white and every other splat in black, or `All classes` to render the colors. The control stays hidden when the file has no segmentation.
+- **Custom data** — a video with custom data lists its keys here, each with the count of its entries (`scene.custom_data_keys()`). `All entries` lists the key and the description of each entry under the preview. Select a key to see its entries in the order of the file, each with its description, its size and its bytes (`scene.custom_data(key)`): as JSON, as text, or as their first 64 bytes in hex, and a picture in a gallery below the list. The control stays hidden when the file has no custom data.
 - **Point clouds** — a video with point clouds shows this checkbox. Select it to draw each point cloud over the RGB image at the time of the `T` slider, in its own color. The point clouds also show under `Flow arrows`. A point cloud of 21 points draws as a hand, with its bones.
 
 The app renders at the aspect ratio of the camera, with a longer side of 1536 pixels. The bounding box camera renders square.

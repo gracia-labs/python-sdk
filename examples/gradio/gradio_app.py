@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import io
 import itertools
+import json
 import math
 import os
 import struct
@@ -12,6 +14,7 @@ from pathlib import Path
 
 import gradio as gr
 import numpy as np
+from PIL import Image
 
 from graciasdk import (HAND_EDGES, GraciaSDK, camera_from_bbox, camera_from_colmap, draw_flow_arrows,
                        draw_points, flow_colors)
@@ -112,11 +115,53 @@ def _camera_update():
 
 
 def _scene_updates():
-    """The time and flow time show for a video only."""
+    """The time, the flow time and the custom data show for a video only."""
     video = bool(_scene and _scene.is_video)
     clouds = bool(_scene and _scene.point_clouds)
     return (gr.update(visible=video), gr.update(visible=video),
-            _instance_update(), _camera_update(), gr.update(value=False, visible=clouds))
+            _instance_update(), _camera_update(), gr.update(value=False, visible=clouds), _data_update())
+
+
+def _data_update():
+    """Each key of the custom data once, in the order of the file, after the choice of every entry."""
+    keys = [key for key, _ in _scene.custom_data_keys()] if _scene else []
+    choices = [("All entries", "")] + [(f"{key} ({keys.count(key)})", key) for key in dict.fromkeys(keys)]
+    return gr.update(choices=choices, value="", visible=bool(keys))
+
+
+def _shown(data: bytes):
+    """The bytes of an entry as a picture, or as Markdown: JSON, text, or the first bytes in hex."""
+    try:
+        return Image.open(io.BytesIO(data)), "a picture, in the gallery below"
+    except Exception:
+        pass
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, f"`{data[:64].hex(' ')}{' …' if len(data) > 64 else ''}`"
+    try:
+        return None, f"```json\n{json.dumps(json.loads(text), indent=2)}\n```"
+    except ValueError:
+        return None, f"> {text}"
+
+
+def show_custom_data(key: str | None):
+    """Every entry of custom data with its key and description, or the entries of one key with their bytes."""
+    listed = _scene.custom_data_keys() if _scene else ()
+    if not listed:
+        return gr.update(value="", visible=False), gr.update(value=[], visible=False)
+    if not key:
+        lines = [f"**{len(listed)}** {'entry' if len(listed) == 1 else 'entries'} of custom data"]
+        lines += [f"{i}. `{k}`: {description or 'no description'}" for i, (k, description) in enumerate(listed, 1)]
+        return gr.update(value="\n".join(lines), visible=True), gr.update(value=[], visible=False)
+    entries = _scene.custom_data(key)
+    lines, pictures = [f"**{len(entries)}** {'entry' if len(entries) == 1 else 'entries'} under `{key}`"], []
+    for i, (description, data) in enumerate(entries, 1):
+        picture, shown = _shown(data)
+        if picture is not None:
+            pictures.append((picture, description))
+        lines.append(f"{i}. **{description or 'no description'}**, {len(data):,} bytes\n\n{shown}")
+    return gr.update(value="\n\n".join(lines), visible=True), gr.update(value=pictures, visible=bool(pictures))
 
 
 def load_scene(file_path: str | None):
@@ -281,6 +326,8 @@ def main() -> None:
                 instance_select = gr.Dropdown(label="Class", choices=[("All classes", 0)],
                                               value=0, visible=False, interactive=True)
                 clouds_toggle = gr.Checkbox(label="Point clouds", value=False, visible=False)
+                data_key = gr.Dropdown(label="Custom data", choices=[("All entries", "")], value="", visible=False,
+                                       interactive=True)
                 gr.Markdown("---")
                 colmap_file = gr.File(label="COLMAP (images.bin + cameras.bin)",
                                       file_types=[".bin"], file_count="multiple", type="filepath")
@@ -289,11 +336,16 @@ def main() -> None:
                 cam_info = gr.Textbox(label="Camera params", interactive=False, max_lines=6)
             with gr.Column(scale=1):
                 preview = gr.Image(label="Preview", type="numpy", format="png", elem_id="preview")
+                data_entries = gr.Markdown(visible=False)
+                data_pictures = gr.Gallery(label="Pictures of the custom data", visible=False, columns=4, height="auto")
 
         inputs = [video_time, mode, colmap_select, instance_select, camera_select, clouds_toggle, flow_time]
         outputs = [preview, cam_info]
-        scene_outputs = [video_time, flow_time, instance_select, camera_select, clouds_toggle]
-        scene_file.change(load_scene, scene_file, scene_outputs).then(render, inputs, outputs)
+        scene_outputs = [video_time, flow_time, instance_select, camera_select, clouds_toggle, data_key]
+        data_outputs = [data_entries, data_pictures]
+        scene_file.change(load_scene, scene_file, scene_outputs).then(render, inputs, outputs).then(
+            show_custom_data, data_key, data_outputs)
+        data_key.input(show_custom_data, data_key, data_outputs)
         colmap_file.change(load_colmap, colmap_file, [colmap_select, colmap_status]).then(render, inputs, outputs)
         instance_select.change(set_instance, instance_select, None).then(render, inputs, outputs)
         for inp in inputs:

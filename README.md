@@ -213,6 +213,23 @@ for description, data in scene.custom_data("rig"):
 
 The scene reads the file at each call: `custom_data_keys` reads its head alone, and `custom_data` also the bytes of the entries with the key. A video with no custom data, a key that no entry has, and a static scene give an empty tuple.
 
+## Splat attributes in the scene
+
+`scene.attributes(time)` gives the raw floats of each splat of a video at a time: the values that the GPU decodes, before a render. It renders nothing, and a render reads no attributes.
+
+```python
+a = scene.attributes(1.5)                                  # every field
+a.position.shape, a.sh.shape                               # (N, 3), (N, 45)
+a = scene.attributes(1.5, fields=("position", "opacity"))  # only these; the other fields are None
+np.savez("splats_1.5s.npz", position=a.position, opacity=a.opacity)
+```
+
+- The rows are the splats that live at the time, in the order of the video. Their count changes with the time.
+- Each value is in the coordinates of the video, before `scene.set_transform` and before a transform of its track.
+- The call seeks the video and waits for the data of the time, as a view with the same `wait` does. When the data does not come, `a.buffering` is `True`.
+- `sh` takes 45 floats a splat, 15 times as much as `position`: ask only for the fields that you need.
+- A static scene and a `.mint` video raise `ValueError`, and so does a name that is not a field of `SplatAttributes`.
+
 ## API
 
 **`GraciaSDK(max_splats_count=16_000_000)`**
@@ -249,6 +266,17 @@ The arrays of a view belong to the view: copy an array before you draw into it.
 - `.point_clouds -> (PointCloud, …)` — the point clouds that the file carries, in the order of the file
 - `.custom_data_keys() -> ((key, description), …)` — the key and the description of each entry of custom data, in the order of the file
 - `.custom_data(key) -> ((description, bytes), …)` — the entries of custom data with that key, in the order of the file
+- `.attributes(time, fields=None, wait=True) -> SplatAttributes` — the splats of a video at `time` as it decodes them, with no render; see [Splat attributes](#splat-attributes-in-the-scene)
+
+**`SplatAttributes`** — one row for each splat that lives at the time; a field that the call does not ask for is `None`
+- `.position` — `float32` `(N, 3)`
+- `.scale` — `float32` `(N, 3)`, linear
+- `.rotation` — `float32` `(N, 4)`, a unit quaternion `(w, x, y, z)`
+- `.opacity` — `float32` `(N,)` in `[0, 1]`
+- `.color` — `float32` `(N, 3)`, the color of band 0: `0.5 + C0 * f_dc`
+- `.sh` — `float32` `(N, 45)`, the coefficients 1 to 15 of red, then green, then blue, as `f_rest` of a 3DGS PLY; `0` where the video has no bands 1 to 3
+- `.instance` — `uint16` `(N,)`, the instance id of each splat: `0xFFFF` for no instance, `0` where the video labels none
+- `.buffering` — the video had no data for the time: the rows are of an earlier time, or every field is `None`
 
 **`SceneCamera`**
 - `.at(time=0.0) -> CameraSetup` — the camera to render with at that time
@@ -302,7 +330,7 @@ arrows = draw_flow_arrows(view.color8.copy(), flow.flow, flow.coverage, colors)
 
 ## Example
 
-`examples/gradio` is a local UI. Load a scene, frame it from its bounding box, from the cameras a video carries or from COLMAP cameras, switch between RGB, depth, and flow, scrub the timeline for 4DGS, isolate one instance, and draw the point clouds. See its [README](examples/gradio/README.md). One command:
+`examples/gradio` is a local UI. Load a scene, frame it from its bounding box, from the cameras a video carries or from COLMAP cameras, switch between RGB, depth, and flow, scrub the timeline for 4DGS, isolate one instance, draw the point clouds, and save the raw floats of the splats at a time. See its [README](examples/gradio/README.md). One command:
 
 ```sh
 cd examples/gradio

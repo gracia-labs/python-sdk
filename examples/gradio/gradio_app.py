@@ -9,6 +9,7 @@ import json
 import math
 import os
 import struct
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +78,8 @@ _FOV = math.radians(60)
 _BBOX = -1
 _CLOUD_COLORS = ((1.0, 0.25, 0.25), (0.25, 0.7, 1.0), (0.3, 1.0, 0.4), (1.0, 0.85, 0.2))
 _FLOW_MODES = ("Flow", "Flow arrows")
+_ATTRIBUTES = ("position", "scale", "rotation", "opacity", "color", "sh", "instance")
+_TABLE_ROWS = 100
 
 _sdk: GraciaSDK | None = None
 _scene = None
@@ -115,11 +118,12 @@ def _camera_update():
 
 
 def _scene_updates():
-    """The time, the flow time and the custom data show for a video only."""
+    """The time, the flow time, the attributes and the custom data show for a video only."""
     video = bool(_scene and _scene.is_video)
     clouds = bool(_scene and _scene.point_clouds)
     return (gr.update(visible=video), gr.update(visible=video),
-            _instance_update(), _camera_update(), gr.update(value=False, visible=clouds), _data_update())
+            _instance_update(), _camera_update(), gr.update(value=False, visible=clouds), _data_update(),
+            gr.update(visible=video))
 
 
 def _data_update():
@@ -310,6 +314,51 @@ def set_instance(instance_id: int | None):
         _scene.set_uint("instance_filter", int(instance_id or 0))
 
 
+def _times(video_time: float, times: str) -> list[float]:
+    """The seconds of the box, or the time of the ``T`` slider when the box is empty."""
+    listed = [float(t) for t in times.replace(",", " ").split()]
+    return listed or [_clip_seconds(video_time)]
+
+
+def _columns(name: str, values: np.ndarray) -> list[str]:
+    return [name] if values.ndim == 1 else [f"{name}[{i}]" for i in range(values.shape[1])]
+
+
+def _summary(t: float, buffering: bool, arrays: dict[str, np.ndarray]) -> str:
+    rows = len(next(iter(arrays.values()))) if arrays else 0
+    lines = [f"**{t:.6f} s**: {rows:,} splats{' (buffering)' if buffering else ''}"]
+    for name, values in arrays.items():
+        span = f", from {values.min():.6g} to {values.max():.6g}" if len(values) else ""
+        lines.append(f"- `{name}` {values.dtype} {tuple(values.shape)}{span}")
+    return "\n".join(lines)
+
+
+def read_attributes(video_time: float, times: str, fields: list[str]):
+    """The raw floats of the splats at each time: a summary, the first rows of the first time, and an ``.npz`` file a time."""
+    if not (_scene and _scene.is_video):
+        return "", gr.update(value=None, visible=False), None
+    try:
+        seconds = _times(video_time, times)
+    except ValueError:
+        return "Times are seconds, separated by commas or spaces", gr.update(value=None, visible=False), None
+    folder = Path(tempfile.mkdtemp(prefix="graciasdk-attributes-"))
+    asked = [f for f in _ATTRIBUTES if f in fields]
+    summaries, files, table = [], [], None
+    for t in seconds:
+        attributes = _scene.attributes(t, fields=asked)
+        arrays = {f: getattr(attributes, f) for f in asked if getattr(attributes, f) is not None}
+        path = folder / f"attributes_{t:.6f}s.npz"
+        np.savez(path, time=np.float64(t), buffering=attributes.buffering, **arrays)
+        files.append(str(path))
+        summaries.append(_summary(t, attributes.buffering, arrays))
+        if table is None and arrays:
+            head = [v[:_TABLE_ROWS].reshape(len(v[:_TABLE_ROWS]), -1).astype(np.float64) for v in arrays.values()]
+            columns = [c for name, v in arrays.items() for c in _columns(name, v)]
+            table = gr.update(value={"headers": columns, "data": np.hstack(head).tolist()}, visible=True,
+                              label=f"The first {_TABLE_ROWS} splats at {t:.6f} s")
+    return "\n\n".join(summaries), table or gr.update(value=None, visible=False), files
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -328,6 +377,11 @@ def main() -> None:
                 clouds_toggle = gr.Checkbox(label="Point clouds", value=False, visible=False)
                 data_key = gr.Dropdown(label="Custom data", choices=[("All entries", "")], value="", visible=False,
                                        interactive=True)
+                with gr.Group(visible=False) as attributes_box:
+                    attribute_fields = gr.CheckboxGroup(list(_ATTRIBUTES), value=[f for f in _ATTRIBUTES if f != "sh"],
+                                                        label="Attributes")
+                    attribute_times = gr.Textbox(label="Times (s)", placeholder="empty: T, or 0.5, 1.25, 2")
+                    attribute_button = gr.Button("Read the raw floats")
                 gr.Markdown("---")
                 colmap_file = gr.File(label="COLMAP (images.bin + cameras.bin)",
                                       file_types=[".bin"], file_count="multiple", type="filepath")
@@ -338,14 +392,19 @@ def main() -> None:
                 preview = gr.Image(label="Preview", type="numpy", format="png", elem_id="preview")
                 data_entries = gr.Markdown(visible=False)
                 data_pictures = gr.Gallery(label="Pictures of the custom data", visible=False, columns=4, height="auto")
+                attribute_summary = gr.Markdown()
+                attribute_table = gr.Dataframe(visible=False, interactive=False)
+                attribute_files = gr.File(label="Raw floats, an .npz a time", file_count="multiple")
 
         inputs = [video_time, mode, colmap_select, instance_select, camera_select, clouds_toggle, flow_time]
         outputs = [preview, cam_info]
-        scene_outputs = [video_time, flow_time, instance_select, camera_select, clouds_toggle, data_key]
+        scene_outputs = [video_time, flow_time, instance_select, camera_select, clouds_toggle, data_key, attributes_box]
         data_outputs = [data_entries, data_pictures]
         scene_file.change(load_scene, scene_file, scene_outputs).then(render, inputs, outputs).then(
             show_custom_data, data_key, data_outputs)
         data_key.input(show_custom_data, data_key, data_outputs)
+        attribute_button.click(read_attributes, [video_time, attribute_times, attribute_fields],
+                               [attribute_summary, attribute_table, attribute_files])
         colmap_file.change(load_colmap, colmap_file, [colmap_select, colmap_status]).then(render, inputs, outputs)
         instance_select.change(set_instance, instance_select, None).then(render, inputs, outputs)
         for inp in inputs:

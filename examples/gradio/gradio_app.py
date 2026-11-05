@@ -9,6 +9,7 @@ import json
 import math
 import os
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +19,10 @@ from PIL import Image
 
 from graciasdk import (HAND_EDGES, GraciaSDK, camera_from_bbox, camera_from_colmap, draw_flow_arrows,
                        draw_points, flow_colors)
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hand_models"))
+
+from hand_models import draw_hand_models, hand_model_keys, load_hand_models, poser_for  # noqa: E402
 
 # ── COLMAP binary loader ──────────────────────────────────────────────────────
 
@@ -84,6 +89,8 @@ _view = None
 _bbox_camera = None
 _colmap_cameras: list[_ColmapCam] = []
 _colmap_setups: dict[str, object] = {}
+_hand_models: dict[str, object] = {}
+_hand_posers: dict[str, object] = {}
 
 
 def _init() -> GraciaSDK:
@@ -119,7 +126,14 @@ def _scene_updates():
     video = bool(_scene and _scene.is_video)
     clouds = bool(_scene and _scene.point_clouds)
     return (gr.update(visible=video), gr.update(visible=video),
-            _instance_update(), _camera_update(), gr.update(value=False, visible=clouds), _data_update())
+            _instance_update(), _camera_update(), gr.update(value=False, visible=clouds), _data_update(), *_hands_updates())
+
+
+def _hands_updates():
+    """The keys of the hand models of the video, off at first, and the choice of a mesh."""
+    keys = hand_model_keys(_scene) if _scene else []
+    return (gr.update(choices=[("Off", "")] + [(key, key) for key in keys], value="", visible=bool(keys)),
+            gr.update(value=False, visible=bool(keys)))
 
 
 def _data_update():
@@ -167,6 +181,8 @@ def show_custom_data(key: str | None):
 def load_scene(file_path: str | None):
     global _scene, _view, _bbox_camera
     _scene, _view, _bbox_camera = None, None, None
+    _hand_models.clear()
+    _hand_posers.clear()
     if file_path and Path(file_path).is_file():
         try:
             scene = _init().load(file_path)
@@ -244,6 +260,18 @@ def _with_clouds(image: np.ndarray) -> np.ndarray:
     return image
 
 
+def _with_hands(image: np.ndarray, key: str, mesh: bool) -> np.ndarray:
+    """The hands of a key over the image at the time of the view."""
+    if key not in _hand_models:
+        _hand_models[key] = load_hand_models(_scene, key)
+    models = _hand_models[key]
+    if mesh and key not in _hand_posers:
+        _hand_posers[key] = poser_for(models)
+    width = image.shape[1]
+    return draw_hand_models(image, _view.camera_setup, models, _view.time, _hand_posers[key] if mesh else None,
+                          square=max(2, width // 250), line=max(1, width // 700))
+
+
 def _depth_image(depth: np.ndarray, coverage: np.ndarray) -> np.ndarray:
     """Depth is a ratio, thus a barely covered pixel gets a full-strength value and the edges get a hard fringe.
     Multiply by the coverage to give the edges the same falloff that the colour has."""
@@ -258,7 +286,7 @@ def _depth_image(depth: np.ndarray, coverage: np.ndarray) -> np.ndarray:
 
 
 def render(video_time: float, mode: str, colmap_name: str | None, instance_id: int | None, camera_index: int | None,
-           clouds: bool, flow_time: float):
+           clouds: bool, flow_time: float, hands_key: str, hands_mesh: bool):
     global _view
     if _scene is None:
         return None, ""
@@ -269,7 +297,7 @@ def render(video_time: float, mode: str, colmap_name: str | None, instance_id: i
     _view.camera, _view.width, _view.height, _view.time = camera, width, height, t
 
     try:
-        image, note = _output(mode, bool(clouds), flow_time)
+        image, note = _output(mode, bool(clouds), flow_time, hands_key, bool(hands_mesh))
     except Exception as e:
         return None, f"{info}\n{e}"
     if _view.buffering:
@@ -277,11 +305,15 @@ def render(video_time: float, mode: str, colmap_name: str | None, instance_id: i
     return image, f"{info}\n{note}".strip()
 
 
-def _output(mode: str, clouds: bool, flow_time: float):
-    """The image of the mode with the point clouds over it when asked, and a note."""
+def _output(mode: str, clouds: bool, flow_time: float, hands_key: str, hands_mesh: bool):
+    """The image of the mode with the point clouds and the hands over it when asked, and a note."""
     image, note = _mode_image(mode, flow_time)
-    if clouds and image is not None:
-        image = _with_clouds(np.repeat(image[..., None], 3, axis=2) if image.ndim == 2 else image.copy())
+    if image is not None and (clouds or hands_key):
+        image = np.repeat(image[..., None], 3, axis=2) if image.ndim == 2 else image.copy()
+        if clouds:
+            _with_clouds(image)
+        if hands_key:
+            _with_hands(image, hands_key, hands_mesh)
     return image, note
 
 
@@ -326,6 +358,8 @@ def main() -> None:
                 instance_select = gr.Dropdown(label="Class", choices=[("All classes", 0)],
                                               value=0, visible=False, interactive=True)
                 clouds_toggle = gr.Checkbox(label="Point clouds", value=False, visible=False)
+                hands_key = gr.Dropdown(label="Hand models", choices=[("Off", "")], value="", visible=False, interactive=True)
+                hands_mesh = gr.Checkbox(label="Hand mesh", value=False, visible=False)
                 data_key = gr.Dropdown(label="Custom data", choices=[("All entries", "")], value="", visible=False,
                                        interactive=True)
                 gr.Markdown("---")
@@ -339,9 +373,9 @@ def main() -> None:
                 data_entries = gr.Markdown(visible=False)
                 data_pictures = gr.Gallery(label="Pictures of the custom data", visible=False, columns=4, height="auto")
 
-        inputs = [video_time, mode, colmap_select, instance_select, camera_select, clouds_toggle, flow_time]
+        inputs = [video_time, mode, colmap_select, instance_select, camera_select, clouds_toggle, flow_time, hands_key, hands_mesh]
         outputs = [preview, cam_info]
-        scene_outputs = [video_time, flow_time, instance_select, camera_select, clouds_toggle, data_key]
+        scene_outputs = [video_time, flow_time, instance_select, camera_select, clouds_toggle, data_key, hands_key, hands_mesh]
         data_outputs = [data_entries, data_pictures]
         scene_file.change(load_scene, scene_file, scene_outputs).then(render, inputs, outputs).then(
             show_custom_data, data_key, data_outputs)

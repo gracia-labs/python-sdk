@@ -31,6 +31,8 @@ The app opens a browser on `127.0.0.1`. Set `GRADIO_SERVER_NAME=0.0.0.0` to serv
 - **Class** — a video with segmentation lists its classes here. Select one to render that instance in white and every other splat in black, or `All classes` to render the colors. The control stays hidden when the file has no segmentation.
 - **Custom data** — a video with custom data lists its keys here, each with the count of its entries (`scene.custom_data_keys()`). `All entries` lists the key and the description of each entry under the preview. Select a key to see its entries in the order of the file, each with its description, its size and its bytes (`scene.custom_data(key)`): as JSON, as text, or as their first 64 bytes in hex, and a picture in a gallery below the list. The control stays hidden when the file has no custom data.
 - **Point clouds** — a video with point clouds shows this checkbox. Select it to draw each point cloud over the RGB image at the time of the `T` slider, in its own color. The point clouds also show under `Flow arrows`. A point cloud of 21 points draws as a hand, with its bones.
+- **Hand models** — a video with SOMA-X hand models in its custom data lists their key here, `soma_hands`. Select a key to draw the joints of each hand at the time of the `T` slider. See the [hand models example](../hand_models/README.md).
+- **Hand mesh** — select it to also draw the mesh of the hand model. SOMA-X needs the model from [its GitHub repository](https://github.com/NVlabs/SOMA-X): add `--with "py-soma-x @ git+https://github.com/NVlabs/SOMA-X@v0.3.4"` to the command.
 
 The app renders at the aspect ratio of the camera, with a longer side of 1536 pixels. The bounding box camera renders square.
 

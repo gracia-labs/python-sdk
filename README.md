@@ -7,7 +7,7 @@ This repository ships **prebuilt wheels**. There is nothing to compile.
 ```
 wheels/              prebuilt graciasdk wheels, one per platform
 examples/gradio/     local UI: load a scene, pick a camera, preview RGB/depth/flow
-examples/notebooks/  a video tutorial: RGB and depth videos, instance overlay
+examples/notebooks/  a video tutorial: RGB and depth videos, instance overlay, hand models
 ```
 
 ## Requirements
@@ -213,6 +213,8 @@ for description, data in scene.custom_data("rig"):
 
 The scene reads the file at each call: `custom_data_keys` reads its head alone, and `custom_data` also the bytes of the entries with the key. A video with no custom data, a key that no entry has, and a static scene give an empty tuple.
 
+A video can carry the poses of the SOMA-X hand model as JSON entries, under the key `soma_hands`. [`examples/hand_models`](examples/hand_models/README.md) states the format, which is a draft, and it unpacks and draws the hands.
+
 ## API
 
 **`GraciaSDK(max_splats_count=16_000_000)`**
@@ -309,9 +311,13 @@ cd examples/gradio
 uv run --find-links ../../wheels --with graciasdk --with gradio gradio_app.py
 ```
 
+### Hand models
+
+[`examples/hand_models`](examples/hand_models/README.md) unpacks the SOMA-X hands of a video from its custom data, poses the hand model, and draws the joints and the mesh over a view.
+
 ### RGB, depth, and instance notebook
 
-[`examples/notebooks/video_rgb_depth_instances.ipynb`](examples/notebooks/video_rgb_depth_instances.ipynb) is a complete video rendering tutorial. It selects an embedded dynamic camera with a reproducible random seed. It renders the first 30 RGB and depth frames, writes H.264 videos, and displays both videos in the notebook. It then renders every embedded instance ID at time 0 and draws the visible masks over RGB. It does not read an external `cameras.json` file.
+[`examples/notebooks/video_dynamic_camera.ipynb`](examples/notebooks/video_dynamic_camera.ipynb) is a complete video rendering tutorial. It selects an embedded dynamic camera with a reproducible random seed. It renders the first 30 RGB and depth frames, writes H.264 videos, and displays both videos in the notebook. It then renders every embedded instance ID at time 0 and draws the visible masks over RGB. It does not read an external `cameras.json` file.
 
 The companion [`requirements.txt`](examples/notebooks/requirements.txt) lists every direct dependency. Run the notebook from the repository root:
 
@@ -319,10 +325,10 @@ The companion [`requirements.txt`](examples/notebooks/requirements.txt) lists ev
 uv run --isolated --no-project --python 3.12 \
   --find-links wheels \
   --with-requirements examples/notebooks/requirements.txt \
-  jupyter lab examples/notebooks/video_rgb_depth_instances.ipynb
+  jupyter lab examples/notebooks/video_dynamic_camera.ipynb
 ```
 
-Set `VIDEO_PATH` in the **Settings** cell before the first run. The video must carry its cameras, with at least one dynamic camera.
+Set `VIDEO_PATH` in the **Settings** cell before the first run. The video must carry its cameras, with at least one dynamic camera, and SOMA-X hand models in its custom data.
 
 ## Troubleshooting
 

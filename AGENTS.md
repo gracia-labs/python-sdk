@@ -7,10 +7,11 @@
 This is a **distribution repository**: the prebuilt `graciasdk` wheels, the documentation to use them, and an example that runs. There is no source code here, and nothing in this repository compiles.
 
 ```
-wheels/              prebuilt .whl artifacts, one per (python tag, platform tag)
-examples/gradio/     gradio UI exercising the public API
-examples/notebooks/  a video tutorial notebook and its requirements
-README.md            install + API reference — the only docs users get
+wheels/                prebuilt .whl artifacts, one per (python tag, platform tag)
+examples/gradio/       gradio UI exercising the public API
+examples/hand_models/  the draft format of hand models in custom data, and code that unpacks and draws them
+examples/notebooks/    a video tutorial notebook and its requirements
+README.md              install + API reference — the only docs users get
 ```
 
 The wheels are published artifacts. Each wheel carries the compiled extension module with `graciasdk/__init__.py`, the Python wrapper. Treat them as opaque and immutable.

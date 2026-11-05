@@ -5,3 +5,5 @@ ipython>=8,<10
 jupyterlab>=4.3,<5
 matplotlib>=3.8,<4
 numpy>=1.26,<3
+pillow>=10,<13
+py-soma-x @ git+https://github.com/NVlabs/SOMA-X@v0.3.4

@@ -208,11 +208,8 @@ def load_colmap(files: list[str] | None):
 
 
 def _clip_seconds(video_time: float) -> float:
-    """The end of the clip is exclusive: a seek to the duration shows nothing."""
-    if not (_scene and _scene.is_video):
-        return 0.0
-    duration = _scene.duration()
-    return min(float(video_time) * duration, max(0.0, duration - 1e-6))
+    """The seconds of a slider, a part of the clip; the scene holds its end, which plays no frame, to its last microsecond."""
+    return float(video_time) * _scene.duration() if _scene and _scene.is_video else 0.0
 
 
 def _camera(colmap_name: str | None, camera_index: int | None):

@@ -121,6 +121,8 @@ The wait is 5 seconds for each scene by default. `sdk.view(..., wait=10.0)` sets
 
 A view first waits for the **first** frame of a video (30 s timeout), and it raises `RuntimeError` when that times out. `scene.wait_ready()`, `scene.ready()`, `scene.wait_buffered(timeout=5.0)` and `scene.is_buffering()` give the same signals without a view. `scene.bbox()` and `scene.adaptive_bbox()` wait for ready themselves, thus they can block too.
 
+A video takes a time to the nearest microsecond. A frame can fall between two microseconds, and the microsecond nearest a frame shows that frame: thus `k / fps` shows frame `k`. A time before 0 shows 0, and a time at or past the end of a video shows its last microsecond. A view and `scene.attributes` hold the time so; `scene.set_time` holds the end only once the video knows its `duration()`.
+
 ## Cameras
 
 A `CameraSetup` is a projection matrix with a camera-to-world transform. Both are 4×4 column-major float32. The projection is the Vulkan style: depth in `[0, 1]`, Y flipped.
@@ -228,7 +230,7 @@ np.savez("splats_1.5s.npz", position=a.position, opacity=a.opacity)
 - Each value is in the coordinates of the video, before `scene.set_transform` and before a transform of its track.
 - The call seeks the video and waits for the data of the time, as a view with the same `wait` does. When the data does not come, `a.buffering` is `True`.
 - `sh` takes 45 floats a splat, 15 times as much as `position`: ask only for the fields that you need.
-- A static scene and a `.mint` video raise `ValueError`, and so does a name that is not a field of `SplatAttributes`.
+- A static scene and a video in the `.mint` format raise `ValueError`, and so does a name that is not a field of `SplatAttributes`. The SDK reads the format of a file from its bytes, not from its name.
 
 ## API
 

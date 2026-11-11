@@ -1,7 +1,8 @@
-"""Read the SOMA-X hands of a video from its custom data, pose them, and draw them over a view.
+"""Read the SOMA-X hands of a video from its custom data, pose them, and draw them over a view. Read the confidence of the
+keypoints of the hands from the custom data too, and aggregate it into one confidence of a hand.
 
-The README of this folder describes the format. The stored joints need only this module. A mesh and the keypoints of the
-model also need SOMA-X from https://github.com/NVlabs/SOMA-X.
+The README of this folder describes the formats. The stored joints and the keypoint confidence need only this module. A
+mesh and the keypoints of the model also need SOMA-X from https://github.com/NVlabs/SOMA-X.
 """
 
 from __future__ import annotations
@@ -14,13 +15,20 @@ from typing import Iterable, Sequence
 import numpy as np
 from PIL import Image, ImageDraw
 
-from graciasdk import HAND_EDGES, CameraSetup, Scene, draw_points, look_at, make_camera, perspective
+from graciasdk import HAND_EDGES, CameraSetup, PointCloud, Scene, draw_points, look_at, make_camera, perspective
 
 HAND_MODEL_KEYS = ("soma_hands",)
+KEYPOINT_CONFIDENCE_KEY = "hand_keypoint_confidence"
+CONFIDENCE_AGGREGATES = ("mean", "median", "min", "max", "seen")
+FINGERTIPS = (4, 8, 12, 16, 20)  # the tips of the thumb, index, middle, ring and little fingers, in the order of HAND_EDGES
 MESH_COLOR = (0.35, 0.67, 0.92)
 JOINT_COLOR = (1.0, 0.85, 0.1)
 _FORMAT = "hand_models"
 _VERSION = 1
+_CONFIDENCE_FORMAT = "hand_keypoint_confidence"
+_CONFIDENCE_VERSION = 1
+_NEAR_ROW = 1e-3  # a time this many rows from a row, or nearer, reads that row as it is
+_AGGREGATES = {"mean": np.mean, "median": np.median, "min": np.min, "max": np.max}
 _FINGER_JOINTS = 24
 _KEYPOINTS = 21
 _SOMA_KEYPOINTS = [0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 24]
@@ -119,6 +127,82 @@ def hand_model_keys(scene: Scene) -> list[str]:
 def load_hand_models(scene: Scene, key: str) -> HandModels:
     """The hand models of a video under one key."""
     return unpack_hand_models(scene.custom_data(key))
+
+
+@dataclass(frozen=True)
+class ConfidenceChunk:
+    """The keypoint confidence of one chunk, from `begin` to `end` in microseconds of the track: ``(R, 21)`` rows for each hand by name, which spread evenly from the begin to the end of the chunk, both included."""
+    begin: int
+    end: int
+    samples: int
+    hands: dict[str, np.ndarray]
+
+    def place(self, time: float) -> float:
+        """Where a time in seconds falls among the rows: 2.5 is halfway from row 2 to row 3."""
+        return (time * 1e6 - self.begin) / (self.end - self.begin) * (self.samples - 1)
+
+
+@dataclass(frozen=True)
+class KeypointConfidence:
+    """How well the cameras saw each keypoint of the point clouds of the hands: the `chunks` in the order of time, and the names of their `hands`."""
+    chunks: tuple[ConfidenceChunk, ...]
+    hands: tuple[str, ...]
+
+    def at(self, hand: str, time: float) -> np.ndarray:
+        """The ``(21,)`` confidence of the keypoints of a hand at a time in seconds, in the order of `HAND_EDGES`, NaN with no data.
+
+        A time at a row reads the row as it is, and a time between two rows reads a value on the line between them. A time that two chunks share reads the later chunk.
+        """
+        chunk = next((chunk for chunk in reversed(self.chunks) if chunk.place(time) >= -_NEAR_ROW), None)
+        if chunk is None or chunk.place(time) > chunk.samples - 1 + _NEAR_ROW or hand not in chunk.hands:
+            return np.full(_KEYPOINTS, np.nan, dtype=np.float32)
+        rows, place = chunk.hands[hand], chunk.place(time)
+        if abs(place - round(place)) <= _NEAR_ROW:
+            return rows[round(place)].copy()
+        before = int(place)
+        return rows[before] + np.float32(place - before) * (rows[before + 1] - rows[before])
+
+    def of_cloud(self, cloud: PointCloud, duration: float) -> np.ndarray:
+        """The ``(F, 21)`` confidence of each frame of a point cloud of a hand, in the order of ``cloud.positions``, NaN with no data. `duration` is the duration of the video in seconds: frame ``k`` is at ``k * duration / F``."""
+        count = len(cloud.positions)
+        return np.stack([self.at(cloud.name, k * duration / count) for k in range(count)])
+
+
+def unpack_keypoint_confidence(entries: Iterable[tuple[str, bytes]]) -> KeypointConfidence:
+    """The keypoint confidence of the ``(description, data)`` entries of `KEYPOINT_CONFIDENCE_KEY`, the result of `scene.custom_data(KEYPOINT_CONFIDENCE_KEY)`."""
+    parts = [json.loads(data) for _, data in entries]
+    if not parts:
+        raise ValueError("no entries of keypoint confidence")
+    chunks = []
+    for part in sorted(parts, key=lambda part: part["begin"]):
+        if part["format"] != _CONFIDENCE_FORMAT or part["version"] != _CONFIDENCE_VERSION:
+            raise ValueError(f"expected {_CONFIDENCE_FORMAT} version {_CONFIDENCE_VERSION}, got {part['format']} version {part['version']}")
+        hands = {name: np.array(hand["confidence"], dtype=np.float32) for name, hand in part["hands"].items()}
+        shapes = {rows.shape for rows in hands.values()}
+        if len(shapes) > 1 or any(len(shape) != 2 or shape[0] < 2 or shape[1] != _KEYPOINTS for shape in shapes):
+            raise ValueError(f"expected rows of {_KEYPOINTS} values, at least two and as many for each hand, got the shapes {sorted(shapes)}")
+        if hands:
+            chunks.append(ConfidenceChunk(part["begin"], part["end"], shapes.pop()[0], hands))
+    return KeypointConfidence(tuple(chunks), tuple(dict.fromkeys(name for chunk in chunks for name in chunk.hands)))
+
+
+def load_keypoint_confidence(scene: Scene) -> KeypointConfidence | None:
+    """The keypoint confidence of a video, ``None`` when it carries none."""
+    entries = scene.custom_data(KEYPOINT_CONFIDENCE_KEY)
+    return unpack_keypoint_confidence(entries) if entries else None
+
+
+def hand_confidence(values: np.ndarray, aggregate: str = "mean") -> np.ndarray:
+    """One confidence of a hand from the confidence of its keypoints, the last axis of `values`: ``(21,)`` gives a number, and ``(F, 21)`` gives one for each frame.
+
+    `aggregate` is one of `CONFIDENCE_AGGREGATES`: the ``"mean"``, ``"median"``, ``"min"`` or ``"max"`` of the values, where a keypoint that no camera saw counts as 0, or ``"seen"``, the share of the values above 0. Give a selection of the keypoints, such as ``values[..., FINGERTIPS]``, to aggregate them alone. A row with NaN gives NaN.
+    """
+    values = np.asarray(values, dtype=np.float32)
+    if aggregate == "seen":
+        return np.where(np.isnan(values).any(axis=-1), np.nan, (values > 0).mean(axis=-1)).astype(np.float32)[()]
+    if aggregate not in _AGGREGATES:
+        raise ValueError(f"expected one of {CONFIDENCE_AGGREGATES}, got {aggregate!r}")
+    return _AGGREGATES[aggregate](values, axis=-1)
 
 
 def _turn_bones(first: np.ndarray, second: np.ndarray, between: float) -> np.ndarray:

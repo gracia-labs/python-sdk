@@ -1,8 +1,8 @@
 # Hand models example
 
-A video can carry the poses of the SOMA-X hand model as [custom data](../../README.md#custom-data-in-the-scene). This example unpacks them, poses the hand model, and draws the hands over a view.
+A video can carry the poses of the SOMA-X hand model as [custom data](../../README.md#custom-data-in-the-scene). This example unpacks them, poses the hand model, and draws the hands over a view. It also unpacks the confidence of the hand keypoints, which a video can carry as custom data too, and it aggregates them into one confidence of a hand.
 
-**The format is a draft.** It can change. The macOS and Linux wheels read custom data. The Windows wheel does not.
+**The formats are drafts.** They can change. The macOS and Linux wheels read custom data. The Windows wheel does not.
 
 - `hand_models.py` — the module: unpack, pose, draw.
 - `render_hand_models.py` — a command that renders one image.
@@ -59,6 +59,28 @@ times, keypoints = keypoint_track(models, poser, "hand_0")   # (N,) seconds and 
 ```
 
 All these calls give NaN where the hand has no data. The keypoints are joints of the model. At a row, the keypoints of the model and the `joints` field are the same, up to the rounding of the numbers. Between two rows, the keypoints of the model and the mesh come from one pose, and `joints_at` can differ from them by a few millimeters in fast motion. When you give a poser, `draw_hand_models` draws the keypoints of the model.
+
+### Get the keypoint confidence
+
+The point clouds of the hands hold their keypoints. A video can also carry how well the cameras saw each keypoint:
+
+```python
+from hand_models import FINGERTIPS, hand_confidence, load_keypoint_confidence
+
+confidence = load_keypoint_confidence(scene)          # None when the video carries none
+confidence.at("hand_0", 1.5)                          # (21,) at 1.5 s, in the order of HAND_EDGES
+
+cloud = next(p for p in scene.point_clouds if p.name == "hand_0")
+values = confidence.of_cloud(cloud, scene.duration())  # (F, 21), one row for each frame of cloud.positions
+
+hand_confidence(confidence.at("hand_0", 1.5))         # one number for the hand: the mean of its 21 values
+hand_confidence(values, "min")                        # (F,): the weakest keypoint of each frame
+hand_confidence(values[:, FINGERTIPS], "seen")        # (F,): the share of the fingertips that the cameras saw
+```
+
+A value is from 0 to 1. 0 is a keypoint that no camera saw, and a higher value is a keypoint that the cameras saw better. The values rank the keypoints; they are not probabilities. The confidence is about the cameras, not about the cloud. A point of the cloud can have a position and 0, and a keypoint above 0 can have no position. `at` and `of_cloud` give NaN where the video has no confidence of the hand. A video that carries no confidence, for example one made before this format, gives `None`, and it reads as before in all other ways.
+
+`hand_confidence` aggregates the keypoints, the last axis of the values, into one confidence of the hand: the `mean` (the default), `median`, `min` or `max` of the values, or `seen`, the share of the values above 0. A keypoint that no camera saw counts as 0, thus `mean` is `seen` times the mean of the keypoints that the cameras saw, and `min` is 0 when any keypoint is unseen. A row with NaN gives NaN. Select keypoints, as with `FINGERTIPS`, to aggregate them alone, and use NumPy on the values for any other aggregate.
 
 ## The format
 
@@ -164,3 +186,39 @@ output.vertices, output.joints                                           # (1, V
 ```
 
 `revision` is the part of `model.assets` after `@`. The poses use no pose correctives: the model applies them only with `apply_correctives=True`, thus it does not load them.
+
+### Keypoint confidence
+
+Each chunk of the video that has hands has one entry of keypoint confidence:
+
+| Part | Value |
+| --- | --- |
+| Key | `hand_keypoint_confidence`. |
+| Description | Free text, for example `hand keypoint confidence, 0.000-1.067 s`. |
+| Data | JSON in UTF-8. |
+
+```json
+{
+  "format": "hand_keypoint_confidence",
+  "version": 1,
+  "begin": 0,
+  "end": 1066667,
+  "hands": {
+    "hand_0": {"confidence": [[0.16006084, 0.12146974, 0.1728376], [0.15721, 0.11914, 0.1695], [0.0, 0.0, 0.0]]},
+    "hand_1": {"confidence": [[0.12072428, 0.10337523, 0.16589865], [0.12101, 0.10297, 0.16478], [0.11972, 0.10012, 0.16234]]}
+  }
+}
+```
+
+This example shortens each row to three values, and it shows three rows.
+
+| Field | Meaning |
+| --- | --- |
+| `format`, `version` | `hand_keypoint_confidence` and `1`. A reader refuses other values, and it ignores fields that it does not know. |
+| `begin`, `end` | The time range of the chunk, in microseconds of the track. |
+| `hands` | The hands of this chunk by name. The name is the name of the point cloud of the same hand, for example `hand_0`. |
+| `confidence` | `R` × 21: one row for each sample of the chunk, in the order of the points of the cloud and `HAND_EDGES`. A value is from 0 to 1, and 0 is a keypoint that no camera saw. A value has the digits that a float32 needs. |
+
+The rows and the time are the same as for the hand models ([Rows and time](#rows-and-time)): the rows spread evenly from `begin` to `end`, both included, and the later of two chunks holds the time that they share. Between two rows the value moves along a line. A hand that an entry does not name has no confidence in that chunk.
+
+A row and the frame of the point cloud nearest its time hold the same instant. The last row of the last chunk has no frame: the cloud has no frame at the end of the video.

@@ -14,7 +14,7 @@ examples/notebooks/  a video tutorial: RGB and depth videos, instance overlay, k
 
 - CPython 3.12 or newer — one wheel for each platform covers every version
 - A standard interpreter with the GIL enabled — **the SDK does not support free-threaded builds (`3.13t`, `3.14t`, …)**
-- GPU and driver: Vulkan on Windows/Linux, Metal on macOS 11 or later (Apple silicon only — the SDK does not support Intel Macs)
+- GPU and driver: Vulkan on Windows/Linux, Metal on macOS 14 or later (Apple silicon only — the SDK does not support Intel Macs)
 - `numpy` (the wheel pulls it in automatically) — every output of a view is a NumPy array
 
 ## Install
@@ -42,7 +42,7 @@ The `cp312` in the file name is a *floor*, not an exact match. The same file ins
 | Host | Wheel |
 | --- | --- |
 | Windows x64 | `cp312-abi3-win_amd64` |
-| macOS Apple Silicon | `cp312-abi3-macosx_11_0_arm64` |
+| macOS Apple Silicon | `cp312-abi3-macosx_14_0_arm64` |
 | Linux x64 | `cp312-abi3-manylinux_*_x86_64` |
 
 Only the platforms in `wheels/` are available. The SDK does not support Python 3.11 and older.
@@ -380,7 +380,7 @@ pip install --no-cache-dir --force-reinstall --find-links wheels graciasdk
 
 **A frame that ignores `view.time`** — the view has `wait=False` and the decoder had not caught up; the loader keeps showing the last good frame while it buffers. `view.buffering` flags exactly that.
 
-**GPU initialization fails** — confirm a Vulkan-capable driver (Windows/Linux) or macOS 11 or later for Metal. Headless Linux still needs a real GPU device and driver.
+**GPU initialization fails** — confirm a Vulkan-capable driver (Windows/Linux) or macOS 14 or later for Metal. Headless Linux still needs a real GPU device and driver.
 
 ## Contributing
 

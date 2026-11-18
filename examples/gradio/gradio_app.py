@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import io
-import itertools
 import json
 import math
 import os
 import struct
-import sys
 import tempfile
+import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,12 +18,7 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
-from graciasdk import (HAND_EDGES, GraciaSDK, camera_from_bbox, camera_from_colmap, draw_flow_arrows,
-                       draw_points, flow_colors)
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hand_models"))
-
-from hand_models import draw_hand_models, hand_model_keys, load_hand_models, poser_for  # noqa: E402
+from graciasdk import GraciaSDK, camera_from_bbox, camera_from_colmap, draw_flow_arrows, flow_colors
 
 # ── COLMAP binary loader ──────────────────────────────────────────────────────
 
@@ -81,7 +76,6 @@ def _load_colmap(images_bin: Path, cameras_bin: Path) -> list[_ColmapCam]:
 _LONG_SIDE = 1536   # the render's longer side: the preview's size, so nothing renders that the page scales away
 _FOV = math.radians(60)
 _BBOX = -1
-_CLOUD_COLORS = ((1.0, 0.25, 0.25), (0.25, 0.7, 1.0), (0.3, 1.0, 0.4), (1.0, 0.85, 0.2))
 _FLOW_MODES = ("Flow", "Flow arrows")
 _ATTRIBUTES = ("position", "scale", "rotation", "opacity", "color", "sh", "instance")
 _TABLE_ROWS = 100
@@ -92,8 +86,6 @@ _view = None
 _bbox_camera = None
 _colmap_cameras: list[_ColmapCam] = []
 _colmap_setups: dict[str, object] = {}
-_hand_models: dict[str, object] = {}
-_hand_posers: dict[str, object] = {}
 
 
 def _init() -> GraciaSDK:
@@ -127,24 +119,24 @@ def _camera_update():
 def _scene_updates():
     """The time, the flow time, the attributes, the custom data and the hand models show for a video only."""
     video = bool(_scene and _scene.is_video)
-    clouds = bool(_scene and _scene.point_clouds)
+    points = bool(_scene and _scene.hand_keypoints)
     return (gr.update(visible=video), gr.update(visible=video),
-            _instance_update(), _camera_update(), gr.update(value=False, visible=clouds), _data_update(),
+            _instance_update(), _camera_update(), gr.update(value=False, visible=points), _data_update(),
             gr.update(visible=video), *_hands_updates())
 
 
 def _hands_updates():
-    """The keys of the hand models of the video, off at first, and the choice of a mesh."""
-    keys = hand_model_keys(_scene) if _scene else []
-    return (gr.update(choices=[("Off", "")] + [(key, key) for key in keys], value="", visible=bool(keys)),
-            gr.update(value=False, visible=bool(keys)))
+    """The hand models of the video and the choice of a mesh, both off at first."""
+    shown = bool(_scene and _scene.hand_models)
+    return gr.update(value=False, visible=shown), gr.update(value=False, visible=shown)
 
 
 def _data_update():
-    """Each key of the custom data once, in the order of the file, after the choice of every entry."""
-    keys = [key for key, _ in _scene.custom_data_keys()] if _scene else []
-    choices = [("All entries", "")] + [(f"{key} ({keys.count(key)})", key) for key in dict.fromkeys(keys)]
-    return gr.update(choices=choices, value="", visible=bool(keys))
+    """The choice of the values and of every blob, then each blob in the order of the file."""
+    blobs = _scene.blobs if _scene else ()
+    shown = bool(_scene and (blobs or _scene.values or _scene.video_values))
+    choices = [("Values and all blobs", -1)] + [(f"{b.index}: {b.key}", b.index) for b in blobs]
+    return gr.update(choices=choices, value=-1, visible=shown)
 
 
 def _shown(data: bytes):
@@ -163,37 +155,47 @@ def _shown(data: bytes):
         return None, f"> {text}"
 
 
-def show_custom_data(key: str | None):
-    """Every entry of custom data with its key and description, or the entries of one key with their bytes."""
-    listed = _scene.custom_data_keys() if _scene else ()
-    if not listed:
+def show_custom_data(index: int | None):
+    """The values of the file and of its track with the list of the blobs, or one blob with its bytes."""
+    blobs = _scene.blobs if _scene else ()
+    values = {"Values of the file": _scene.video_values, "Values of the track": _scene.values} if _scene else {}
+    if not blobs and not any(values.values()):
         return gr.update(value="", visible=False), gr.update(value=[], visible=False)
-    if not key:
-        lines = [f"**{len(listed)}** {'entry' if len(listed) == 1 else 'entries'} of custom data"]
-        lines += [f"{i}. `{k}`: {description or 'no description'}" for i, (k, description) in enumerate(listed, 1)]
-        return gr.update(value="\n".join(lines), visible=True), gr.update(value=[], visible=False)
-    entries = _scene.custom_data(key)
-    lines, pictures = [f"**{len(entries)}** {'entry' if len(entries) == 1 else 'entries'} under `{key}`"], []
-    for i, (description, data) in enumerate(entries, 1):
-        picture, shown = _shown(data)
-        if picture is not None:
-            pictures.append((picture, description))
-        lines.append(f"{i}. **{description or 'no description'}**, {len(data):,} bytes\n\n{shown}")
-    return gr.update(value="\n\n".join(lines), visible=True), gr.update(value=pictures, visible=bool(pictures))
+    if index is None or index < 0:
+        lines = [f"**{title}**\n\n```json\n{json.dumps(v, indent=2)}\n```" for title, v in values.items() if v]
+        lines += [f"**{len(blobs)}** {'blob' if len(blobs) == 1 else 'blobs'}"]
+        lines += [f"- {b.index}: `{b.key}`, {b.description or 'no description'}, {b.size:,} bytes" for b in blobs]
+        return gr.update(value="\n\n".join(lines), visible=True), gr.update(value=[], visible=False)
+    blob = blobs[index]
+    picture, shown = _shown(_scene.blob(index))
+    text = f"**{blob.index}: `{blob.key}`**, {blob.description or 'no description'}, {blob.size:,} bytes\n\n{shown}"
+    pictures = [(picture, blob.description)] if picture is not None else []
+    return gr.update(value=text, visible=True), gr.update(value=pictures, visible=bool(pictures))
+
+
+def _readable(path: Path) -> bool:
+    """Whether the file opens for reading within 30 s: a copy that Windows still holds right after it was written does not."""
+    for _ in range(300):
+        try:
+            with open(path, "rb"):
+                return True
+        except PermissionError:
+            time.sleep(0.1)
+    return False
 
 
 def load_scene(file_path: str | None):
     global _scene, _view, _bbox_camera
     _scene, _view, _bbox_camera = None, None, None
-    _hand_models.clear()
-    _hand_posers.clear()
-    if file_path and Path(file_path).is_file():
+    file_path = (file_path or "").strip().strip('"')
+    if file_path and Path(file_path).is_file() and _readable(Path(file_path)):
         try:
             scene = _init().load(file_path)
             scene.wait_ready()
             _scene = scene
-        except Exception:
-            _scene = None
+        except Exception as e:
+            traceback.print_exc()
+            gr.Warning(f"{Path(file_path).name} does not load: {e}")
     return _scene_updates()
 
 
@@ -235,7 +237,7 @@ def _camera(colmap_name: str | None, camera_index: int | None):
     if camera_index is not None and 0 <= camera_index < len(cameras):
         sc = cameras[camera_index]
         fx, fy, cx, cy = sc.pinhole
-        poses = f"{sc.poses_count} poses over the track" if sc.is_dynamic else "one pose"
+        poses = f"{sc.poses_count} poses from {sc.times[0]:.2f} s to {sc.times[-1]:.2f} s" if sc.is_dynamic else "one pose"
         return sc, _fit(sc.width, sc.height), (f"scene camera {sc.name} ({sc.kind})  {sc.width}×{sc.height}\n"
                                                f"fx={fx:.1f}  fy={fy:.1f}  cx={cx:.1f}  cy={cy:.1f}\n{poses}")
     cc = next((c for c in _colmap_cameras if c.name == colmap_name), None)
@@ -253,26 +255,6 @@ def _camera(colmap_name: str | None, camera_index: int | None):
     return _bbox_camera, (_LONG_SIDE, _LONG_SIDE), f"bounding box camera  fov={math.degrees(_FOV):.0f}°"
 
 
-def _with_clouds(image: np.ndarray) -> np.ndarray:
-    width = image.shape[1]
-    for (cloud, points), color in zip(_view.points, itertools.cycle(_CLOUD_COLORS)):
-        edges = HAND_EDGES if len(points) == 21 else ()
-        draw_points(image, _view.camera_setup, points, edges, color, square=max(2, width // 250), line=max(1, width // 700))
-    return image
-
-
-def _with_hands(image: np.ndarray, key: str, mesh: bool) -> np.ndarray:
-    """The hands of a key over the image at the time of the view."""
-    if key not in _hand_models:
-        _hand_models[key] = load_hand_models(_scene, key)
-    models = _hand_models[key]
-    if mesh and key not in _hand_posers:
-        _hand_posers[key] = poser_for(models)
-    width = image.shape[1]
-    return draw_hand_models(image, _view.camera_setup, models, _view.time, _hand_posers[key] if mesh else None,
-                          square=max(2, width // 250), line=max(1, width // 700))
-
-
 def _depth_image(depth: np.ndarray, coverage: np.ndarray) -> np.ndarray:
     """Depth is a ratio, thus a barely covered pixel gets a full-strength value and the edges get a hard fringe.
     Multiply by the coverage to give the edges the same falloff that the colour has."""
@@ -287,7 +269,7 @@ def _depth_image(depth: np.ndarray, coverage: np.ndarray) -> np.ndarray:
 
 
 def render(video_time: float, mode: str, colmap_name: str | None, instance_id: int | None, camera_index: int | None,
-           clouds: bool, flow_time: float, hands_key: str, hands_mesh: bool):
+           series: bool, flow_time: float, hands: bool, hands_mesh: bool):
     global _view
     if _scene is None:
         return None, ""
@@ -298,7 +280,7 @@ def render(video_time: float, mode: str, colmap_name: str | None, instance_id: i
     _view.camera, _view.width, _view.height, _view.time = camera, width, height, t
 
     try:
-        image, note = _output(mode, bool(clouds), flow_time, hands_key, bool(hands_mesh))
+        image, note = _output(mode, bool(series), flow_time, bool(hands), bool(hands_mesh))
     except Exception as e:
         return None, f"{info}\n{e}"
     if _view.buffering:
@@ -306,15 +288,16 @@ def render(video_time: float, mode: str, colmap_name: str | None, instance_id: i
     return image, f"{info}\n{note}".strip()
 
 
-def _output(mode: str, clouds: bool, flow_time: float, hands_key: str, hands_mesh: bool):
-    """The image of the mode with the point clouds and the hands over it when asked, and a note."""
+def _output(mode: str, series: bool, flow_time: float, hands: bool, hands_mesh: bool):
+    """The image of the mode with the points of the series and the hands over it when asked, and a note."""
     image, note = _mode_image(mode, flow_time)
-    if image is not None and (clouds or hands_key):
+    hands = hands or hands_mesh
+    if image is not None and (series or hands):
         image = np.repeat(image[..., None], 3, axis=2) if image.ndim == 2 else image.copy()
-        if clouds:
-            _with_clouds(image)
-        if hands_key:
-            _with_hands(image, hands_key, hands_mesh)
+        if series:
+            _view.draw_series(image)
+        if hands:
+            _view.draw_hands(image, mesh=hands_mesh)
     return image, note
 
 
@@ -396,6 +379,7 @@ def main() -> None:
             with gr.Column(scale=0, min_width=240):
                 scene_file = gr.File(label="Scene (.ply, .sog or a 4DGS video)",
                                      file_count="single", type="filepath")
+                scene_path = gr.Textbox(label="Or the path of a scene on this computer", placeholder="C:/scenes/video.grv")
                 mode = gr.Radio(["RGB", "Depth", *_FLOW_MODES], value="RGB", label="Mode")
                 camera_select = gr.Dropdown(label="Scene camera", choices=[("Bounding box", _BBOX)],
                                             value=_BBOX, visible=False, interactive=True)
@@ -403,11 +387,11 @@ def main() -> None:
                 flow_time = gr.Slider(0, 1, value=0, step=0.01, label="Flow to T", visible=False)
                 instance_select = gr.Dropdown(label="Class", choices=[("All classes", 0)],
                                               value=0, visible=False, interactive=True)
-                clouds_toggle = gr.Checkbox(label="Point clouds", value=False, visible=False)
-                hands_key = gr.Dropdown(label="Hand models", choices=[("Off", "")], value="", visible=False, interactive=True)
+                series_toggle = gr.Checkbox(label="Series", value=False, visible=False)
+                hands_toggle = gr.Checkbox(label="Hand models", value=False, visible=False)
                 hands_mesh = gr.Checkbox(label="Hand mesh", value=False, visible=False)
-                data_key = gr.Dropdown(label="Custom data", choices=[("All entries", "")], value="", visible=False,
-                                       interactive=True)
+                data_blob = gr.Dropdown(label="Custom data", choices=[("Values and all blobs", -1)], value=-1, visible=False,
+                                        interactive=True)
                 with gr.Group(visible=False) as attributes_box:
                     attribute_fields = gr.CheckboxGroup(list(_ATTRIBUTES), value=[f for f in _ATTRIBUTES if f != "sh"],
                                                         label="Attributes")
@@ -427,14 +411,17 @@ def main() -> None:
                 attribute_table = gr.Dataframe(visible=False, interactive=False)
                 attribute_files = gr.File(label="Raw floats, an .npz a time", file_count="multiple")
 
-        inputs = [video_time, mode, colmap_select, instance_select, camera_select, clouds_toggle, flow_time, hands_key, hands_mesh]
+        inputs = [video_time, mode, colmap_select, instance_select, camera_select, series_toggle, flow_time, hands_toggle,
+                  hands_mesh]
         outputs = [preview, cam_info]
-        scene_outputs = [video_time, flow_time, instance_select, camera_select, clouds_toggle, data_key, attributes_box,
-                         hands_key, hands_mesh]
+        scene_outputs = [video_time, flow_time, instance_select, camera_select, series_toggle, data_blob, attributes_box,
+                         hands_toggle, hands_mesh]
         data_outputs = [data_entries, data_pictures]
         scene_file.change(load_scene, scene_file, scene_outputs).then(render, inputs, outputs).then(
-            show_custom_data, data_key, data_outputs)
-        data_key.input(show_custom_data, data_key, data_outputs)
+            show_custom_data, data_blob, data_outputs)
+        scene_path.submit(load_scene, scene_path, scene_outputs).then(render, inputs, outputs).then(
+            show_custom_data, data_blob, data_outputs)
+        data_blob.input(show_custom_data, data_blob, data_outputs)
         attribute_button.click(read_attributes, [video_time, attribute_times, attribute_fields],
                                [attribute_summary, attribute_table, attribute_files])
         colmap_file.change(load_colmap, colmap_file, [colmap_select, colmap_status]).then(render, inputs, outputs)

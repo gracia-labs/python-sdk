@@ -9,7 +9,6 @@ This is a **distribution repository**: the prebuilt `graciasdk` wheels, the docu
 ```
 wheels/                prebuilt .whl artifacts, one per (python tag, platform tag)
 examples/gradio/       gradio UI exercising the public API
-examples/hand_models/  the draft format of hand models in custom data, and code that unpacks and draws them
 examples/notebooks/    a video tutorial notebook and its requirements
 README.md              install + API reference — the only docs users get
 ```
@@ -40,7 +39,7 @@ uv run --find-links ../../wheels --with graciasdk --with gradio gradio_app.py
 uv run --find-links ../../wheels --with graciasdk python -c "import graciasdk; print(graciasdk.__all__)"
 ```
 
-A real render needs a GPU (Vulkan on Windows/Linux, Metal on macOS) and a scene file. `.ply` / `.sog` are static. Every other file is 4DGS video, and a view waits for its data. Only a video of the capture pipeline carries cameras, instance labels and point clouds.
+A real render needs a GPU (Vulkan on Windows/Linux, Metal on macOS) and a scene file. `.ply` / `.sog` are static. Every other file is 4DGS video, and a view waits for its data. Only a video of the capture pipeline carries cameras, instance labels and series.
 
 ### A new wheel does not appear
 

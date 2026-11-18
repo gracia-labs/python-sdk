@@ -95,7 +95,7 @@ The camera aspect must match the aspect of the view.
 | `.ply` | static 3DGS |
 | `.sog` | static, compressed |
 | `.mint` | video 4DGS |
-| any other | video 4DGS; such a file can also carry the cameras of the capture, the instance labels and point clouds |
+| any other | video 4DGS; such a file can also carry the cameras of the capture, the instance labels and series, as the points of a hand |
 
 `.ply`, `.sog` and `.guf` load as a static scene. The SDK loads every other file as a video stream.
 
@@ -119,7 +119,7 @@ view.color8                               # waits for the data for that time
 
 The wait is 5 seconds for each scene by default. `sdk.view(..., wait=10.0)` sets it, and `wait=False` skips it. A read never raises when the data is not there after the wait, also with `wait=False`: `view.buffering` becomes `True`, which means that an output is *not* the time that you asked for. It shows an earlier time, or nothing if nothing had decoded yet. A static scene is never buffering.
 
-A view first waits for the **first** frame of a video (30 s timeout), and it raises `RuntimeError` when that times out. `scene.wait_ready()`, `scene.ready()`, `scene.wait_buffered(timeout=5.0)` and `scene.is_buffering()` give the same signals without a view. `scene.bbox()` and `scene.adaptive_bbox()` wait for ready themselves, thus they can block too.
+A view first waits for the **first** frame of a video (30 s timeout), and it raises `RuntimeError` when that times out, and at once, with the reason, for a file that the video refuses: a file that it does not play, that needs a newer player, or that holds a head hash. `scene.wait_ready()`, `scene.ready()`, `scene.wait_buffered(timeout=5.0)` and `scene.is_buffering()` give the same signals without a view. `scene.bbox()` and `scene.adaptive_bbox()` wait for ready themselves, thus they can block too.
 
 A video takes a time to the nearest microsecond. A frame can fall between two microseconds, and the microsecond nearest a frame shows that frame: thus `k / fps` shows frame `k`. A time before 0 shows 0, and a time at or past the end of a video shows its last microsecond. A view and `scene.attributes` hold the time so; `scene.set_time` holds the end only once the video knows its `duration()`.
 
@@ -159,14 +159,14 @@ cam = scene.camera("014")           # by name, or scene.camera(13) by index
 view = sdk.view(scene, cam, cam.width, cam.height, time=1.5)
 ```
 
-A view takes a `SceneCamera` as it is and uses it at `view.time`, thus the camera and the frame stay together. `cam.at(time)` gives the `CameraSetup` for a time in seconds:
+A view takes a `SceneCamera` as it is and uses it at `view.time`, thus the camera and the frame stay together. The view moves the camera with the scene and with the track of the video, as their splats move, thus the render shows what the camera recorded. `cam.at(time)` gives the `CameraSetup` for a time in seconds, in the coordinates of the video, as the rows and the series are. A view takes a `CameraSetup` in the coordinates of the world.
 
 - A **static** camera holds one pose. It ignores the time.
-- A **dynamic** camera holds one pose for each frame, spread evenly over the track: pose `i` is at `begin + i * (end - begin) / cam.poses_count`, where `begin` and `end` are the first and the last instant of the track. Between two poses the camera interpolates them — the rotation along the shortest arc, and the position along a straight line. A time before the first pose or after the last pose clamps to it.
+- A **dynamic** camera holds a pose at each of its times, `cam.times` in seconds. Between two poses the position moves along a straight line and the rotation along the shorter arc. A time where the video states no pose, or a pose that is not finite, takes the finite pose nearest in time. `cam.qvecs` and `cam.tvecs` keep a pose that is not finite as NaN.
 
 The projection comes from the COLMAP intrinsics of the source image. Thus render at the aspect ratio of `cam.width / cam.height` for an image with no distortion.
 
-A static scene and a video with no camera data report `scene.cameras` as empty.
+A static scene and a video with no camera data report `scene.cameras` as empty. A camera that states no pose, as a camera whose path the cut of an edit leaves empty, is not in `scene.cameras`.
 
 ## Instances in the scene
 
@@ -181,41 +181,158 @@ scene.set_uint("instance_filter", 0)      # the colors again
 
 Every splat still takes part in visibility, thus an object in front of the instance hides it in the mask. A static scene and a video with no segmentation report no instance names, and the filter does not change them.
 
-## Point clouds in the scene
+## Series in the scene
 
-A video's track can carry point clouds, for example the hands of the capture. Each `PointCloud` holds one set of points for each frame, spread evenly over the track in the same way as the poses of a dynamic camera. The scene reads them from the file when you first use them.
+A video's track can carry series: data over time, for example the points of the hands of the capture. A series has a name, attributes that it samples at times, and values of its own. Its samples come in chunks, and a time that no chunk plays has no data. The scene reads the list of the series from the file when you first use it.
 
 ```python
-from graciasdk import HAND_EDGES, draw_points
+hand = next(s for s in scene.series if s.name == "hand_0")
+hand.index, hand.attributes               # 0, (("positions", "F32", (21, 3), "Linear"),)
+hand.at(1.5)["positions"]                 # (21, 3) float32 at the frame of 1.5 s; None where no chunk plays it
+hand.at()                                 # each attribute at the frame that the video shows now
+chunk = hand.samples()[0]
+chunk.times, chunk.attributes["positions"]   # (S,) seconds and (S, 21, 3), NaN where a sample has no data
 
-hand = next(p for p in scene.point_clouds if p.name == "hand_0")
-hand.positions.shape                      # (F, N, 3) float32, NaN where a frame has no data
-points = hand.at(1.5)                     # (N, 3) at that time in seconds
-
-image = view.color8.copy()                # the view keeps its array: draw into a copy
-for cloud, points in view.points:         # each point cloud at view.time
-    draw_points(image, view.camera_setup, points, HAND_EDGES, color=(1.0, 0.2, 0.2))
+image = view.draw_series()                # view.color8 with the hand of each series at view.time
 ```
 
-`hand.at(time)` moves each point along a line between the two frames around the time. A point with no data in either frame is NaN.
+`series.at(time)` seeks the video to the time and waits for its data, as `scene.attributes(time)` does. The video loads the series with its splats, thus the call gives each attribute at the frame that the video shows, and the points and the splats are of one frame. `series.at()` with no time reads the frame that the video shows now, with no seek and no wait. A `wait` of `False` reads what has decoded, and `None` comes also where the data of the time did not come. `series.at(time)` gives each attribute by its interpolation. A `"Linear"` value moves along a line between the two samples around the time. A `"Rotation"`, unit quaternions `(x, y, z, w)`, turns along the shorter arc. A `"Step"` holds the sample before the time, and a `"Constant"` is one value for its whole chunk. A NaN is a value that a sample does not have, thus a point with no data in either sample is NaN.
 
-`draw_points(image, camera, points, edges)` projects the points with the camera. It draws a square at each point and a line for each edge `(a, b)` into the image, in place. The image is a float image in `[0, 1]` or an 8-bit image, with 3 or 4 channels. A NaN point, or a point behind the camera, draws nothing. The drawing goes over the splats, and it does not test depth. `HAND_EDGES` is the 20 bones between the 21 keypoints of a hand.
+`view.draw_series(image=None)` draws the hands of the series over a copy of `view.color8`, or into `image` in place. Each series of `scene.hand_keypoints`, a series of an OpenPose hand with its 21 `positions` ([The series of the hands](#the-series-of-the-hands)), draws as a hand with the bones of `HAND_EDGES`, and any other series draws nothing. Each hand lands on its splats, also where the track or the scene moves and from a camera in the coordinates of the world. Series `k` of a scene takes the color `SERIES_COLORS[k % 6]`. The size of the squares and of the lines follows the width of the image.
 
-A static scene and a video with no point clouds report `scene.point_clouds` as empty.
+`draw_points(image, camera, points, edges)` draws other points, in the coordinates of the world. It projects the points with the camera. It draws a square at each point and a line for each edge `(a, b)` into the image, in place. The image is a float image in `[0, 1]` or an 8-bit image, with 3 or 4 channels. A NaN point, or a point behind the camera, draws nothing. The drawing goes over the splats, and it does not test depth. `HAND_EDGES` is the 20 bones between the 21 keypoints of a hand.
+
+A video can carry the poses of the SOMA-X hand model, as the series `soma_hands/hand_0`, and the confidence of the keypoints of its hands, as `hand_keypoint_confidence/hand_0`: see [Hands in the scene](#hands-in-the-scene).
+
+A static scene and a video with no series report `scene.series` as empty.
+
+## Hands in the scene
+
+A video can carry the poses of the SOMA-X hand model of each hand, and how well the cameras saw each keypoint of a hand, each as a series of the hand ([The series of the hands](#the-series-of-the-hands)). **The series are drafts.** They can change.
+
+```python
+models = scene.hand_models                      # None when the video carries none
+models.hands                                    # ("hand_0", "hand_1")
+models.joints_at("hand_0", 1.5)                 # (21, 3), NaN where the hand has no data
+pose = models.pose_at("hand_0", 1.5)            # HandPose, None where the hand has no data
+pose.shape.side, pose.shape.bones               # "right", (24,)
+
+image = view.draw_hands()                       # view.color8 with the joints of each hand at view.time
+image = view.draw_hands(mesh=True)              # the mesh and the keypoints of the hand model in place of the joints
+```
+
+`view.draw_hands(image=None, mesh=False, hands=None)` draws over a copy of `view.color8`, or into `image` in place. Each hand draws its joints and the bones of `HAND_EDGES` in yellow. With `mesh`, it draws the shaded mesh of the posed model, and the keypoints of the model in place of the joints. `hands` names the hands to draw, each hand by default. Each hand lands on its splats, also where the track or the scene moves and from a camera in the coordinates of the world. The drawing goes over the splats, and it does not test depth, the same as `draw_points`. A time that no chunk of a hand plays draws nothing of that hand.
+
+A mesh and the keypoints of the model need SOMA-X from [its GitHub repository](https://github.com/NVlabs/SOMA-X) and Pillow. The model runs on the CPU, and it downloads its assets the first time:
+
+```sh
+uv run --find-links wheels --with graciasdk --with pillow --with "py-soma-x @ git+https://github.com/NVlabs/SOMA-X@v0.3.4" your_script.py
+```
+
+### Get the keypoints
+
+Two calls give the 21 keypoints of a hand at a time, in the order of `HAND_EDGES`:
+
+```python
+models.joints_at("hand_0", 1.5)                 # from the joints of the series; needs no hand model
+models.keypoints_at("hand_0", 1.5)              # from the hand model, posed with the attributes of the series
+models.poser.keypoints(pose)                    # the same, for a pose that you give
+times, keypoints = models.keypoint_track("hand_0")   # (N,) seconds and (N, 21, 3), one for each sample of the hand
+vertices, faces = models.mesh_at("hand_0", 1.5)      # (V, 3) and (T, 3); None where the hand has no data
+```
+
+All these calls give NaN, or `None`, where the hand has no data. Each value is in the coordinates of the video, as the series are. The keypoints are joints of the model. At a sample, the keypoints of the model and the `joints` attribute are the same, up to the rounding of the numbers. Between two samples, the keypoints of the model and the mesh come from one pose, and `joints_at` can differ from them by a few millimeters in fast motion, as each joint moves along a line. `models.poser` makes the model at its first use. `draw_mesh(image, camera, vertices, faces)` draws a mesh of the world as `draw_points` draws points.
+
+### Get the keypoint confidence
+
+The series of the points of the hands hold their keypoints. A video can also carry how well the cameras saw each keypoint:
+
+```python
+from graciasdk import FINGERTIPS, hand_confidence
+
+confidence = scene.keypoint_confidence          # None when the video carries none
+confidence.at("hand_0", 1.5)                    # (21,) at 1.5 s, in the order of HAND_EDGES
+
+points = next(s for s in scene.series if s.name == "hand_0")
+times = np.concatenate([chunk.times for chunk in points.samples()])
+values = confidence.at_times("hand_0", times)   # (S, 21), one row for each sample of the points
+
+hand_confidence(confidence.at("hand_0", 1.5))   # one number for the hand: the mean of its 21 values
+hand_confidence(values, "min")                  # (F,): the weakest keypoint of each frame
+hand_confidence(values[:, FINGERTIPS], "seen")  # (F,): the share of the fingertips that the cameras saw
+```
+
+A value is from 0 to 1. 0 is a keypoint that no camera saw, and a higher value is a keypoint that the cameras saw better. The values rank the keypoints; they are not probabilities. The confidence is about the cameras, not about the points. A point can have a position and 0, and a keypoint above 0 can have no position. `at` and `at_times` give NaN where the video has no confidence of the hand. A video that carries no confidence, for example one made before this format, gives `None`, and it reads as before in all other ways.
+
+`hand_confidence` aggregates the keypoints, the last axis of the values, into one confidence of the hand: the `mean` (the default), `median`, `min` or `max` of the values, or `seen`, the share of the values above 0. A keypoint that no camera saw counts as 0, thus `mean` is `seen` times the mean of the keypoints that the cameras saw, and `min` is 0 when any keypoint is unseen. A row with NaN gives NaN. Select keypoints, as with `FINGERTIPS`, to aggregate them alone, and use NumPy on the values for any other aggregate.
+
+### The series of the hands
+
+Each hand of the video can have a series of its 21 keypoints, an OpenPose hand. Its values state `format` `openpose_hand`, and its attribute `positions` holds float32 `(21, 3)` for each sample in the scene, in the order of `HAND_EDGES`: the wrist, then four joints of each finger from the thumb to the little finger. Between two samples each keypoint moves along a line, `"Linear"`, and NaN marks a keypoint with no data. The name of the series is the name of the hand, for example `hand_0`.
+
+Each hand of the video that has hand models has one series. Its name is `soma_hands/` and the name of the hand, for example `soma_hands/hand_0`. The name of the hand is the name of the instance and of the series of the points of the same hand.
+
+The values of the series:
+
+| Value | Meaning |
+| --- | --- |
+| `format`, `version` | `hand_models` and `2`. A reader refuses other values, and it ignores values that it does not know. |
+| `model.name` | `soma`. |
+| `model.package`, `model.lod` | The release of the model, and the level of detail of its mesh. `py-soma-x==0.3.4` is the tag `v0.3.4` of the repository. |
+| `model.assets` | The assets of the model on Hugging Face, with their revision. |
+| `side` | `left` or `right`. |
+
+Each chunk holds these attributes of one value for the whole chunk, `"Constant"`:
+
+| Attribute | Shape | Meaning |
+| --- | --- | --- |
+| `identity` | 20 | The shape coefficients of the model. |
+| `scale` | 1 | Scene units for each meter. |
+| `bones` | 24 | The length of each bone of the model in scene units, in the order of `articulation`: from each finger joint to its parent. A reader with no hand model can read them here. |
+| `bone_scales` | 24 | Optional, in each chunk of a series or in none: the scale of each bone length of the model, joints 1 to 24 in the order of `articulation`, 1 for no change. The poser gives them to the model with the identity. |
+
+Each chunk holds these attributes for each sample, float32:
+
+| Attribute | Shape | Meaning | Between two samples |
+| --- | --- | --- | --- |
+| `rotation` | 4 | A unit quaternion `(x, y, z, w)`: the rotation of the wrist frame of the model in the scene. | `"Rotation"`: it turns along the shorter arc. |
+| `translation` | 3 | The wrist joint in the scene. | `"Linear"`: it moves along a line. |
+| `articulation` | 24 × 4 | A unit quaternion for each finger joint, relative to the bind pose of the model. | `"Rotation"`: each joint turns along the shorter arc. |
+| `joints` | 21 × 3 | The joints in the scene, in the order of the hand keypoints and `HAND_EDGES`. A reader with no hand model can draw them. | `"Linear"`: each joint moves along a line. |
+
+Each chunk of the capture has one chunk of each hand. Its samples spread evenly from the start of the chunk to its end, both included. The series states no frame rate and no frame numbers. The last sample of a chunk and the first sample of the next chunk have the same time. The later chunk holds that time. Thus a hand can change at once at the start of a chunk: two chunks can hold different values for the same time, and a reader does not blend them. NaN marks a sample with no data, and a time next to it has no data. A chunk with no sample of the hand is not there: that time has no data of the hand.
+
+A point `x` of the posed model, in meters, goes into the scene with `scale * R(rotation) @ x + translation`. The wrist of the model is at the origin of `x`. The scene is the space of the splats of the video. SOMA-X takes axis angles: `pose_at` turns each quaternion into one. The poser makes these calls to [SOMA-X](https://github.com/NVlabs/SOMA-X):
+
+```python
+import torch
+from soma import SOMAHandLayer
+from soma.assets import get_assets_dir
+
+layer = SOMAHandLayer(data_root=get_assets_dir(revision=revision), hand_type=side, device="cpu", mode="torch", lod=lod, correctives_model_path=None)
+layer.prepare_identity(identity[None], bone_scales, global_scale=scale)  # bone_scales is (1, 24) or None
+output = layer.pose(torch.cat((rotation[None], articulation))[None],     # (1, 25, 3): the wrist comes first
+                    global_translation=translation[None],                # (1, 3)
+                    reference_pose=layer.bind_pose_world[:, :3, :3])     # the rotations are relative to the bind pose
+output.vertices, output.joints                                           # (1, V, 3) and (1, 25, 3), in scene units
+```
+
+`revision` is the part of `model.assets` after `@`. The poses use no pose correctives: the model applies them only with `apply_correctives=True`, thus it does not load them.
+
+Each hand of the video that has keypoint confidence has one series. Its name is `hand_keypoint_confidence/` and the name of the hand, for example `hand_keypoint_confidence/hand_0`, and the name of the hand is that of the series of its points. Its values are `format` `hand_keypoint_confidence` and `version` `2`, and a reader refuses other values. Its one attribute is `confidence`, float32 with 21 values in the order of the points of the hand and `HAND_EDGES`, from 0 to 1, `"Linear"`. Its samples and its time are those of the hand models, and a sample and the sample of the points of the hand at its time hold the same instant.
 
 ## Custom data in the scene
 
-A video's track can carry custom data: entries of any bytes, each with a key and a description. Several entries can have the same key. `scene.custom_data_keys()` lists the key and the description of each entry, and `scene.custom_data(key)` gives the description and the bytes of each entry with that key. Both keep the order of the file:
+A video's file and its track can each carry values, as JSON gives them. The track can also carry blobs of any bytes, each with a key and a description. Several blobs can have the same key. `scene.video_values` gives the values of the file and `scene.values` those of the track. `scene.blobs` lists each blob in the order of the file, and `scene.blob(index)` gives its bytes:
 
 ```python
-scene.custom_data_keys()                  # (("rig", "the capture rig as JSON"), ("note", "…"), …)
-for description, data in scene.custom_data("rig"):
-    rig = json.loads(data)
+scene.video_values                        # {"take": 3, …}
+scene.values                              # {"rig": "R2", …}
+scene.blobs                               # (Blob(index=0, key="rig", description="the capture rig as JSON", size=812), …)
+rig = json.loads(scene.blob(0))
 ```
 
-The scene reads the file at each call: `custom_data_keys` reads its head alone, and `custom_data` also the bytes of the entries with the key. A video with no custom data, a key that no entry has, and a static scene give an empty tuple.
-
-A video can carry the poses of the SOMA-X hand model as JSON entries, under the key `soma_hands`, and the confidence of the keypoints of its point clouds of hands, under the key `hand_keypoint_confidence`. [`examples/hand_models`](examples/hand_models/README.md) states the formats, which are drafts. It unpacks both, and it draws the hands.
+The scene reads the file at each call: `values`, `video_values` and `blobs` read its head alone, and `blob` also the bytes of one blob. A video with no custom data gives `{}` and `()`, and so does a static scene. `scene.blob` raises `IndexError` past the last blob.
 
 ## Splat attributes in the scene
 
@@ -238,7 +355,7 @@ np.savez("splats_1.5s.npz", position=a.position, opacity=a.opacity)
 
 **`GraciaSDK(max_splats_count=16_000_000)`**
 - `.load(path) -> Scene`
-- `.view(scene | [scenes], camera, width, height, time=0.0, model_transform=None, wait=True) -> View` — `camera` is a `CameraSetup` or a `SceneCamera`; `wait` is the seconds to wait for the data of a video's time (`True` = 5 s, `False` = no wait)
+- `.view(scene | [scenes], camera, width, height, time=0.0, model_transform=None, wait=True) -> View` — `camera` is a `CameraSetup` in the coordinates of the world, or a `SceneCamera`, which the view moves with its scene and its track; `wait` is the seconds to wait for the data of a video's time (`True` = 5 s, `False` = no wait)
 
 **`View`** — every output renders when you first read it, and stays until a field or a scene changes
 - `.scenes`, `.camera`, `.width`, `.height`, `.time`, `.model_transform`, `.wait` — set one to change the view
@@ -247,8 +364,10 @@ np.savez("splats_1.5s.npz", position=a.position, opacity=a.opacity)
 - `.depth` — `float32` `(H, W)`, raw view-space Z (unnormalized, negative in front of the camera); `0` where nothing was hit. Normalize it yourself for display.
 - `.coverage` — `float32` `(H, W)` in `[0, 1]`, the accumulated opacity of the splats; it renders with `.depth`
 - `.flow(reference_time) -> FlowResult | None` — the flow from `.time` to `reference_time`; `None` when no scene has flow. See [Flow](#flow)
-- `.points -> ((PointCloud, (N, 3)), …)` — each point cloud of the scenes at `.time`
-- `.camera_setup -> CameraSetup` — the camera at `.time`
+- `.series -> ((Series, {name: array} | None), …)` — each series of the scenes with its attributes at `.time`
+- `.draw_series(image=None) -> image` — the hand of each series of `scene.hand_keypoints` at `.time` over a copy of `.color8`, or into `image` in place; see [Series](#series-in-the-scene)
+- `.draw_hands(image=None, mesh=False, hands=None) -> image` — the SOMA-X hands at `.time` the same way; see [Hands](#hands-in-the-scene)
+- `.camera_setup -> CameraSetup` — the camera at `.time`; for a `SceneCamera`, in the coordinates of the video, as `cam.at(.time)` gives it
 - `.buffering` — an output since the last change is not the time that was asked for (video only; see [Video](#video-4dgs))
 
 The arrays of a view belong to the view: copy an array before you draw into it.
@@ -258,7 +377,7 @@ The arrays of a view belong to the view: copy an array before you draw into it.
 - `.adaptive_bbox()` — the same, with the outliers discounted
 - `.count() -> int` — splat count. For a video it is the frame drawn last: `0` before the first render
 - `.set_transform(m)` — 4×4 model matrix
-- `.set_flag(key, value)` — `"sh3"` for the view-dependent color, `"mip"` for the antialiasing filter. Every scene loads with `"mip"` on, except a video whose track turns it off
+- `.set_flag(key, value)` — `"sh3"` for the view-dependent color, `"mip"` for the antialiasing filter. A video and a `.guf` scene load with `"mip"` on, and a `.ply` or `.sog` scene with it off; a track of a video that states the `Mip` option draws by it until `"mip"` is set
 - `.set_uint(key, value)` — `"instance_filter"`: the id of the instance to render as a mask, `0` for the colors
 - `.instance_names() -> {id: name}` — the instances that a video labels its splats with
 - `.is_video`, `.duration()`, `.set_time(t)`, `.wait_ready(timeout=30.0)`, `.ready()`
@@ -267,9 +386,14 @@ The arrays of a view belong to the view: copy an array before you draw into it.
 - `.cameras -> (SceneCamera, …)` — the cameras that the file carries, sorted by name
 - `.camera_kinds -> ("static" | "dynamic", …)` — one for each camera, in the same order
 - `.camera(name | index) -> SceneCamera`
-- `.point_clouds -> (PointCloud, …)` — the point clouds that the file carries, in the order of the file
-- `.custom_data_keys() -> ((key, description), …)` — the key and the description of each entry of custom data, in the order of the file
-- `.custom_data(key) -> ((description, bytes), …)` — the entries of custom data with that key, in the order of the file
+- `.series -> (Series, …)` — the series that the file carries, in the order of the file. A series keeps no scene alive: a read of a series whose scene is gone raises `ReferenceError`
+- `.hand_keypoints -> (Series, …)` — the series of the OpenPose hands that the video carries
+- `.hand_models -> HandModels | None` — the SOMA-X hands that the video carries
+- `.keypoint_confidence -> KeypointConfidence | None` — how well the cameras saw each keypoint of the hands
+- `.values -> dict` — the values of the custom data of the track
+- `.video_values -> dict` — the values of the custom data of the file
+- `.blobs -> (Blob, …)` — each blob of the custom data of the track, in the order of the file
+- `.blob(index) -> bytes` — the bytes of one blob of `.blobs`
 - `.attributes(time, fields=None, wait=True) -> SplatAttributes` — the splats of a video at `time` as it decodes them, with no render; see [Splat attributes](#splat-attributes-in-the-scene)
 
 **`SplatAttributes`** — one row for each splat that lives at the time; a field that the call does not ask for is `None`
@@ -287,12 +411,41 @@ The arrays of a view belong to the view: copy an array before you draw into it.
 - `.name`, `.kind`, `.is_dynamic`, `.poses_count`
 - `.width`, `.height`, `.model`, `.pinhole` — source image size and intrinsics `(fx, fy, cx, cy)`
 - `.qvecs`, `.tvecs` — the COLMAP world-to-camera poses, `(N, 4)` and `(N, 3)` `float32`
+- `.times` — `(N,)` `float64` seconds of each pose of a dynamic camera; empty for a static camera
 
-**`PointCloud`**
-- `.at(time=0.0) -> (N, 3)` — the points at that time, NaN where there is no data
-- `.name`, `.positions` — `(F, N, 3)` `float32`, the frames spread evenly over the track
+**`Series`**
+- `.at(time=None, wait=True) -> {name: array} | None` — each attribute at the frame of that time, or of the frame that the video shows with no time; `None` where no chunk plays it, or the data of the time did not come
+- `.samples() -> (SeriesChunk, …)` — the samples of each chunk, read from the file at each call
+- `.index` — the place of the series in `scene.series`, and its color in `view.draw_series`
+- `.name`, `.values` — the values of the series as a `dict`
+- `.attributes` — `(name, dtype, shape, interpolation)` of each attribute, the shape of one value
+- `.chunks` — `(begin, end)` seconds of each chunk
 
-**`draw_points(image, camera, points, edges=(), color=(1.0, 0.25, 0.25), square=6, line=2) -> image`** — draw squares at the points and lines along the edges, in place; `HAND_EDGES` is the edges of a hand
+**`SeriesChunk`**
+- `.begin`, `.end` — the seconds where the chunk starts and stops to play
+- `.times` — `(S,)` `float64` seconds of each sample
+- `.attributes` — each attribute by name: `(S, …)`, or the one value of a `"Constant"`
+
+**`HandModels`** — see [Hands in the scene](#hands-in-the-scene)
+- `.hands`, `.model`, `.series` — the names of the hands, the model as the values state it, and the series of each hand
+- `.joints_at(hand, time) -> (21, 3)`, `.pose_at(hand, time) -> HandPose | None`, `.times(hand) -> (N,)`
+- `.keypoints_at(hand, time) -> (21, 3)`, `.mesh_at(hand, time) -> (vertices, faces) | None`, `.keypoint_track(hand) -> (times, keypoints)` — they need SOMA-X
+- `.poser -> SomaPoser` — `.keypoints(pose)`, `.mesh(pose)` and `.faces(side)` of the model
+
+**`HandPose`** — `.shape` (`HandShape`: `.side`, `.identity`, `.scale`, `.bones`, `.bone_scales`), `.articulation` `(24, 3)`, `.rotation` `(3,)` and `.translation` `(3,)`, each rotation an axis angle
+
+**`KeypointConfidence`** — `.hands`, `.series`, `.at(hand, time) -> (21,)`, `.at_times(hand, times) -> (N, 21)`
+
+**`hand_confidence(values, aggregate="mean")`** — one confidence of a hand from the last axis of `values`, by one of `CONFIDENCE_AGGREGATES`; `FINGERTIPS` is the keypoints of the tips of the fingers
+
+**`Blob`**
+- `.index` — the place of the blob in `scene.blobs`, which `scene.blob` takes
+- `.key`, `.description` — several blobs can share a key
+- `.size` — the count of its bytes in the file
+
+**`draw_points(image, camera, points, edges=(), color=(1.0, 0.25, 0.25), square=6, line=2) -> image`** — draw squares at the points and lines along the edges, in place; `HAND_EDGES` is the edges of a hand, and `SERIES_COLORS` the colors of `view.draw_series`
+
+**`draw_mesh(image, camera, vertices, faces, color=(0.35, 0.67, 0.92), opacity=0.6) -> image`** — draw a shaded mesh of the world over the image, in place, with no depth test; it needs Pillow
 
 **`flow_colors(flow, coverage, scale=0.0) -> (colors, scale)`** — `FlowResult.flow` as RGB `uint8` `(H, W, 3)` on the Middlebury color wheel, and the scale that it used. The hue is the direction. A move of `scale` pixels or more is full color, and no move is white. `scale` `0` is the 95th percentile of the moves, or `1` when nothing moves. Each color is multiplied by the `coverage` of its pixel, so edges fade to black as the depth does for display. A pixel with `coverage` at `0.01` or below is black
 
@@ -321,7 +474,7 @@ Keep `.depth` itself as it is for measurement — the multiplication is for disp
 
 `view.flow(reference_time)` does not render colors. A flow frame measures each splat against the flow frame of its scene before it. `flow` makes that flow frame itself, thus `reference_time` and `view.time` must differ for a video, or `ValueError` comes back. Each video goes to `reference_time`, waits, and prepares a flow frame that draws nothing. Then each video goes back to `view.time`, waits again, and draws a flow frame against the first one.
 
-The flow of a pixel is the mean move of the splats on it, weighted by what each splat adds to the color. A move goes from where a splat is at `view.time`, seen from the camera at `view.time`, to where its track held it at `reference_time`, seen from the camera at `reference_time`. Both places take the transform of the track at `view.time`. Thus a dynamic camera that moves adds flow: a static table moves in the image when the camera moves. A track that its file moves along a path adds none: the flow holds the move of the splats inside their track. `x` points right and `y` points down the image rows, so a pixel `(x, y)` moves to `(x + flow[..., 0], y + flow[..., 1])`. Only a splat at both times adds to the flow, and `.coverage` is the opacity of those splats. A pixel with `.coverage` below `1/255` gets flow `0`. Only a video whose splats carry ids has flow. For every other scene, `flow` gives `None`.
+The flow of a pixel is the mean move of the splats on it, weighted by what each splat adds to the color. A move goes from where a splat is at `view.time`, seen from the camera at `view.time`, to where it is at `reference_time`, seen from the camera at `reference_time`. Each place takes the transform of the track at its own time. Thus a track that its file moves along a path adds flow, and so does a dynamic camera that moves: a static table moves in the image when the camera moves. `x` points right and `y` points down the image rows, so a pixel `(x, y)` moves to `(x + flow[..., 0], y + flow[..., 1])`. Only a splat at both times adds to the flow, and `.coverage` is the opacity of those splats. A pixel with `.coverage` below `1/255` gets flow `0`. Only a video whose splats carry ids has flow. For every other scene, `flow` gives `None`.
 
 ```python
 from graciasdk import draw_flow_arrows, flow_colors
@@ -334,16 +487,12 @@ arrows = draw_flow_arrows(view.color8.copy(), flow.flow, flow.coverage, colors)
 
 ## Example
 
-`examples/gradio` is a local UI. Load a scene, frame it from its bounding box, from the cameras a video carries or from COLMAP cameras, switch between RGB, depth, and flow, scrub the timeline for 4DGS, isolate one instance, draw the point clouds, and save the raw floats of the splats at a time. See its [README](examples/gradio/README.md). One command:
+`examples/gradio` is a local UI. Load a scene, frame it from its bounding box, from the cameras a video carries or from COLMAP cameras, switch between RGB, depth, and flow, scrub the timeline for 4DGS, isolate one instance, draw the points of its series and its SOMA-X hands, and save the raw floats of the splats at a time. See its [README](examples/gradio/README.md). One command:
 
 ```sh
 cd examples/gradio
 uv run --find-links ../../wheels --with graciasdk --with gradio gradio_app.py
 ```
-
-### Hand models
-
-[`examples/hand_models`](examples/hand_models/README.md) unpacks the SOMA-X hands of a video from its custom data, poses the hand model, and draws the joints and the mesh over a view. It also unpacks the confidence of the hand keypoints and aggregates it into one confidence of a hand.
 
 ### RGB, depth, and instance notebook
 
@@ -358,7 +507,7 @@ uv run --isolated --no-project --python 3.12 \
   jupyter lab examples/notebooks/video_dynamic_camera.ipynb
 ```
 
-Set `VIDEO_PATH` in the **Settings** cell before the first run. The video must carry its cameras, with at least one dynamic camera, and SOMA-X hand models in its custom data.
+Set `VIDEO_PATH` in the **Settings** cell before the first run. The video must carry its cameras, with at least one dynamic camera, and the series of its SOMA-X hand models.
 
 ## Troubleshooting
 
